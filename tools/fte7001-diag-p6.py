@@ -69,20 +69,20 @@ def capture_04fb():
 
 # ===== 全屏提示 =====
 PROMPT_PATH = "/tmp/fp-prompt.txt"
-PROM_SH = os.path.expanduser("~/Documents/one-mix3/omarchy/fingerprint/09-可行性实验/工具/提示窗-v3-常驻.sh")
+PROM_SH = os.path.expanduser("~/fp-prompt-notify.sh")  # 占位符: 指向本机提示窗脚本
 
 def _hypr_sig():
     try:
-        d = "/run/user/1000/hypr"
+        d = f"/run/user/{os.getuid()}/hypr"
         sigs = [x for x in os.listdir(d) if os.path.isdir(os.path.join(d, x))]
         return sigs[0] if sigs else ""
     except:
         return ""
 
 def as_user(*cmd, timeout=15):
-    env = {"XDG_RUNTIME_DIR": "/run/user/1000",
+    env = {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
            "WAYLAND_DISPLAY": "wayland-1",
-           "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+           "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus",
            "HYPRLAND_INSTANCE_SIGNATURE": _hypr_sig()}
     try:
         if os.geteuid() == 0:
@@ -97,9 +97,9 @@ def as_user(*cmd, timeout=15):
         return -1, ""
 
 def as_user_bg(*cmd):
-    env = {"XDG_RUNTIME_DIR": "/run/user/1000",
+    env = {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
            "WAYLAND_DISPLAY": "wayland-1",
-           "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+           "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus",
            "HYPRLAND_INSTANCE_SIGNATURE": _hypr_sig()}
     try:
         if os.geteuid() == 0:
