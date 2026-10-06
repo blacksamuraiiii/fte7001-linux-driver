@@ -27,6 +27,9 @@
 #include <sys/stat.h>
 #include <sys/utsname.h>
 
+/* Embedded FT9338 cold-boot firmware blob (Windows cold-boot capture verified, 14136 B) */
+#include "ft9338-firmware.inc"
+
 #define FP_COMPONENT "fte7001"
 
 /* ----- GPIO profiles (OneMix3) ----- */
@@ -81,6 +84,13 @@ struct _FpiDeviceFte7001
   gboolean          armed;
   guint             false_finger_count;
   FpiSsm           *task_ssm;
+
+  /* Cold init */
+  gboolean          cold_path;         /* TRUE when A-CUT boot detected */
+  guint             fe_round;          /* FE check loop counter */
+  guint16           chip_id;
+  guint8           *fw_write_buf;      /* 05 FA transfer buffer (header+blob+tail) */
+  guint8           *fw_readback_buf;   /* 04 FB RX buffer */
 
   /* Image */
   FpImage          *captured_image;
@@ -146,19 +156,19 @@ fte7001_submit_transfer (FpiSsm *ssm, FpiSpiTransfer *transfer, gboolean cancell
   transfer->ssm = ssm;
 }
 
+/* Write-only frame (path-2 equivalent): 55 AA (2B), 70 (1B), 05 FA.
+ * No read phase — matches Windows WdfIoTargetSendWriteSynchronously. */
 static void
-fte7001_submit_command (FpiSsm *ssm, guint8 cmd, gboolean cancellable)
+fte7001_submit_write_only (FpiSsm *ssm, const guint8 *data, gsize len)
 {
   FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (fpi_ssm_get_device (ssm));
   FpiSpiTransfer *transfer;
-  const gsize plen = 4096;
 
   self->small_rx_valid = FALSE;
   transfer = fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
-  fpi_spi_transfer_write (transfer, plen);
-  transfer->buffer_wr[0] = cmd;
-  fpi_spi_transfer_read (transfer, 1);
-  fte7001_submit_transfer (ssm, transfer, cancellable);
+  fpi_spi_transfer_write (transfer, len);
+  memcpy (transfer->buffer_wr, data, len);
+  fte7001_submit_transfer (ssm, transfer, FALSE);
 }
 
 static void
@@ -175,6 +185,120 @@ fte7001_reg_read_cb (FpiSpiTransfer *transfer, FpDevice *device,
     }
   self->small_rx_valid = TRUE;
   fpi_ssm_next_state (transfer->ssm);
+}
+
+/* 08 F7 <reg> 00 — short-config read (4B/4B full-duplex).
+ * Value offset is register-dependent: CB in rx[3], C2 in rx[0]. */
+static void
+fte7001_submit_short_read (FpiSsm *ssm, guint8 reg, gboolean cancellable)
+{
+  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (fpi_ssm_get_device (ssm));
+  FpiSpiTransfer *transfer;
+
+  self->small_rx_valid = FALSE;
+  memset (self->small_rx, 0, 4);
+
+  transfer = fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
+  fpi_spi_transfer_write (transfer, 4);
+  transfer->buffer_wr[0] = 0x08;
+  transfer->buffer_wr[1] = 0xf7;
+  transfer->buffer_wr[2] = reg;
+  transfer->buffer_wr[3] = 0x00;
+  fpi_spi_transfer_read_full (transfer, self->small_rx, 4, NULL);
+  fpi_spi_transfer_set_full_duplex (transfer, TRUE);
+  transfer->ssm = ssm;
+  fpi_spi_transfer_submit (
+    transfer,
+    cancellable ? fpi_device_get_cancellable (FP_DEVICE (self)) : NULL,
+    fte7001_reg_read_cb, NULL);
+}
+
+/* 09 F6 <reg> <val> — short-config write.  The Windows capture shows all 09 F6 writes
+ * as opcode=09f6 expRX=4 (full-duplex, response 00 00 00 00), NOT write-only.
+ * Only 55 AA / 70 / 05 FA are write-only (PATH2). */
+static void
+fte7001_submit_short_write (FpiSsm *ssm, guint8 reg, guint8 val,
+                            gboolean cancellable)
+{
+  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (fpi_ssm_get_device (ssm));
+  FpiSpiTransfer *transfer;
+
+  self->small_rx_valid = FALSE;
+  memset (self->small_rx, 0, 4);
+
+  transfer = fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
+  fpi_spi_transfer_write (transfer, 4);
+  transfer->buffer_wr[0] = 0x09;
+  transfer->buffer_wr[1] = 0xf6;
+  transfer->buffer_wr[2] = reg;
+  transfer->buffer_wr[3] = val;
+  fpi_spi_transfer_read_full (transfer, self->small_rx, 4, NULL);
+  fpi_spi_transfer_set_full_duplex (transfer, TRUE);
+  transfer->ssm = ssm;
+  fpi_spi_transfer_submit (
+    transfer,
+    cancellable ? fpi_device_get_cancellable (FP_DEVICE (self)) : NULL,
+    fte7001_reg_read_cb, NULL);
+}
+
+/* 90 00 00 — A-CUT boot detect (3B/3B full-duplex).  RX[2]==0xEF. */
+static void
+fte7001_submit_acut_detect (FpiSsm *ssm)
+{
+  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (fpi_ssm_get_device (ssm));
+  FpiSpiTransfer *transfer;
+
+  self->small_rx_valid = FALSE;
+  memset (self->small_rx, 0, 3);
+
+  transfer = fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
+  fpi_spi_transfer_write (transfer, 3);
+  transfer->buffer_wr[0] = 0x90;
+  transfer->buffer_wr[1] = 0x00;
+  transfer->buffer_wr[2] = 0x00;
+  fpi_spi_transfer_read_full (transfer, self->small_rx, 3, NULL);
+  fpi_spi_transfer_set_full_duplex (transfer, TRUE);
+  transfer->ssm = ssm;
+  fpi_spi_transfer_submit (
+    transfer,
+    fpi_device_get_cancellable (FP_DEVICE (self)),
+    fte7001_reg_read_cb, NULL);
+}
+
+/* 05 FA block write (write-only, 14143 B = 6 header + blob + 1 tail). */
+static void
+fte7001_submit_firmware_write (FpiSsm *ssm)
+{
+  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (fpi_ssm_get_device (ssm));
+  FpiSpiTransfer *transfer;
+
+  transfer = fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
+  fpi_spi_transfer_write_full (transfer, self->fw_write_buf,
+                               6 + FT9338_FW_BLOB_SIZE + 1, NULL);
+  fte7001_submit_transfer (ssm, transfer, TRUE);
+}
+
+/* 04 FB readback (full-duplex, 14144 B).  TX 7-byte cmd + zero padding. */
+static void
+fte7001_submit_firmware_readback (FpiSsm *ssm)
+{
+  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (fpi_ssm_get_device (ssm));
+  FpiSpiTransfer *transfer;
+
+  memset (self->fw_readback_buf, 0, FT9338_FW_READBACK_RX);
+  transfer = fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
+  fpi_spi_transfer_write (transfer, FT9338_FW_READBACK_RX);
+  transfer->buffer_wr[0] = 0x04;
+  transfer->buffer_wr[1] = 0xfb;
+  transfer->buffer_wr[2] = FT9338_FW_ADDR_HIGH;
+  transfer->buffer_wr[3] = FT9338_FW_ADDR_LOW;
+  transfer->buffer_wr[4] = 0x37;   /* len hi: 0x373A = 14138 */
+  transfer->buffer_wr[5] = 0x3a;   /* len lo */
+  transfer->buffer_wr[6] = 0x00;
+  fpi_spi_transfer_read_full (transfer, self->fw_readback_buf,
+                              FT9338_FW_READBACK_RX, NULL);
+  fpi_spi_transfer_set_full_duplex (transfer, TRUE);
+  fte7001_submit_transfer (ssm, transfer, TRUE);
 }
 
 static void
@@ -310,17 +434,27 @@ fte7001_probe_acpi (FpiDeviceFte7001 *self, const gchar *spidev_path)
   return TRUE;
 }
 
-static void
-fte7001_determine_spidev_speed (FpiDeviceFte7001 *self)
+static gboolean
+fte7001_determine_spidev_speed (FpiDeviceFte7001 *self, GError **error)
 {
-  guint32 speed;
+  guint32 speed = 0;
 
-  if (ioctl (self->spi_fd, SPI_IOC_RD_MAX_SPEED_HZ, &speed) != 0)
+  /* FT9338 is only characterised at 1 MHz on this platform.  The
+   * controller ceiling reported by spidev can be far higher (LPSS
+   * controllers advertise tens of MHz); never program that — clamp to
+   * the known-good rate from the header. */
+  if (ioctl (self->spi_fd, SPI_IOC_RD_MAX_SPEED_HZ, &speed) != 0 ||
+      speed == 0 || speed > FTE7001_SPI_SPEED_HZ)
     speed = FTE7001_SPI_SPEED_HZ;
-  if (speed == 0)
-    speed = FTE7001_SPI_SPEED_HZ;
-  /* Configure the speed for all subsequent transfers */
-  ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
+
+  if (ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) != 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "FTE7001: cannot set SPI speed %u Hz: %s",
+                   speed, g_strerror (errno));
+      return FALSE;
+    }
+  return TRUE;
 }
 
 static gboolean
@@ -329,7 +463,8 @@ fte7001_take_gpio (FpiDeviceFte7001 *self, GError **error)
   struct gpiod_line_settings *settings;
   struct gpiod_line_config *config;
   struct gpiod_request_config *req_cfg;
-  const gchar *chip_path;
+  struct gpiod_chip *chip;
+  g_autofree gchar *chip_path = NULL;
 
   settings = gpiod_line_settings_new ();
   gpiod_line_settings_set_direction (settings, GPIOD_LINE_DIRECTION_OUTPUT);
@@ -341,17 +476,32 @@ fte7001_take_gpio (FpiDeviceFte7001 *self, GError **error)
   req_cfg = gpiod_request_config_new ();
   gpiod_request_config_set_consumer (req_cfg, "fte7001");
 
-  chip_path = g_strdup_printf ("/dev/gpiochip0");
-  self->gpio_request = gpiod_chip_request_lines (
-      gpiod_chip_open (chip_path), req_cfg, config);
+  chip_path = g_strdup ("/dev/gpiochip0");
+  chip = gpiod_chip_open (chip_path);
+  if (!chip)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "fte7001 could not open GPIO chip %s: %s",
+                   chip_path, g_strerror (errno));
+      gpiod_line_settings_free (settings);
+      gpiod_line_config_free (config);
+      gpiod_request_config_free (req_cfg);
+      return FALSE;
+    }
+
+  self->gpio_request = gpiod_chip_request_lines (chip, req_cfg, config);
+  /* The chip handle is only needed to create the request; close it on
+   * every path so it does not leak (the request stays valid). */
+  gpiod_chip_close (chip);
   gpiod_line_settings_free (settings);
   gpiod_line_config_free (config);
   gpiod_request_config_free (req_cfg);
 
   if (!self->gpio_request)
     {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "fte7001 could not claim GPIO chip %s", chip_path);
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "fte7001 could not claim GPIO chip %s: %s",
+                   chip_path, g_strerror (errno));
       return FALSE;
     }
   return TRUE;
@@ -362,16 +512,88 @@ static void fte7001_init_handler (FpiSsm *ssm, FpDevice *dev);
 static void fte7001_init_complete (FpiSsm *ssm, FpDevice *dev, GError *error);
 
 enum fte7001_init_state {
-  FTE7001_INIT_RESET_ASSERT,
-  FTE7001_INIT_RESET_HOLD,
-  FTE7001_INIT_RESET_DEASSERT,
-  FTE7001_INIT_RESET_SETTLE,
-  FTE7001_INIT_WAKE_1,
-  FTE7001_INIT_WAKE_DELAY,
-  FTE7001_INIT_WAKE_2,
-  FTE7001_INIT_SETTLE,
-  FTE7001_INIT_READ_MCU,
-  FTE7001_INIT_CHECK_MCU,
+  /* Universal first probe: 90 00 00 3B full-duplex.
+   * Preceded by warm-probe preamble (Windows capture frames 1-11):
+   *   10 EF 20 + 70 wr ×4 + 10 EF 20/16/17
+   * These frames establish initial chip state even though
+   * the responses are garbage/echo on cold boot. */
+  FTE7001_INIT_PREAMBLE_10EF20_1,
+  FTE7001_INIT_PREAMBLE_70_1,
+  FTE7001_INIT_PREAMBLE_70_2,
+  FTE7001_INIT_PREAMBLE_70_3,
+  FTE7001_INIT_PREAMBLE_70_4,
+  FTE7001_INIT_PREAMBLE_10EF20_2,
+  FTE7001_INIT_PREAMBLE_10EF16,
+  FTE7001_INIT_PREAMBLE_10EF17,
+  FTE7001_INIT_ACUT_DETECT,
+  FTE7001_INIT_ACUT_CHECK,
+  /* Warm path: chip already alive (10 EF 20 → A5 5A) */
+  FTE7001_INIT_WARM_READ_MCU,
+  FTE7001_INIT_WARM_CHECK_MCU,
+  /* Cold path: hardware reset (assert 10 ms → deassert → settle 50 ms) */
+  FTE7001_INIT_COLD_RESET_ASSERT,
+  FTE7001_INIT_COLD_RESET_HOLD,
+  FTE7001_INIT_COLD_RESET_DEASSERT,
+  FTE7001_INIT_COLD_SETTLE,
+  /* Cold path: 55 AA → 0xFE existence check loop (5 rounds) */
+  FTE7001_INIT_COLD_55AA,
+  FTE7001_INIT_COLD_FE_CB_READ,
+  FTE7001_INIT_COLD_FE_CB_WRITE,
+  FTE7001_INIT_COLD_FE_FD_WRITE,
+  FTE7001_INIT_COLD_FE_FE_WRITE,
+  FTE7001_INIT_COLD_FE_READ,
+  FTE7001_INIT_COLD_FE_CHECK,
+  FTE7001_INIT_COLD_FE_DELAY,
+  /* Cold path: 10 EF 20 read + 70 wr ×2 alternation (Windows capture frames 43-48,
+   * exit sensormode before download) ×3, then 55 AA #6 */
+  /* The Windows capture has a D0Entry (D5→D0 power transition) between FE loop and the
+   * 10EF20 block — it re-inits SPI+GPIO, i.e. one more GPIO reset. */
+  FTE7001_INIT_COLD_D0_RESET_ASSERT,
+  FTE7001_INIT_COLD_D0_RESET_HOLD,
+  FTE7001_INIT_COLD_D0_RESET_DEASSERT,
+  FTE7001_INIT_COLD_FW_10EF20_1,
+  FTE7001_INIT_COLD_FW_70a_1,
+  FTE7001_INIT_COLD_FW_70a_2,
+  FTE7001_INIT_COLD_FW_10EF20_2,
+  FTE7001_INIT_COLD_FW_70b_1,
+  FTE7001_INIT_COLD_FW_70b_2,
+  FTE7001_INIT_COLD_FW_10EF20_3,
+  /* Cold path: 55 AA #6 — firmware-branch entry (after sensormode exit) */
+  FTE7001_INIT_COLD_FW_55AA,
+  /* Cold path: C2 identification (C2 rx[0]==0x02 → FT9338) */
+  FTE7001_INIT_COLD_C2_WRITE,
+  FTE7001_INIT_COLD_C2_READ,
+  FTE7001_INIT_COLD_C2_CHECK,
+  /* Cold path: download mode (09 F6 C8→CA→CB→B9×2) */
+  FTE7001_INIT_COLD_DL_C8,
+  FTE7001_INIT_COLD_DL_CA,
+  FTE7001_INIT_COLD_DL_CB,
+  FTE7001_INIT_COLD_DL_B9A,
+  FTE7001_INIT_COLD_DL_B9B,
+  /* Cold path: firmware 05 FA write + 04 FB readback */
+  FTE7001_INIT_COLD_FW_WRITE,
+  FTE7001_INIT_COLD_FW_READBACK,
+  /* Cold path: chip restart after firmware download.
+   * Windows DownLoadFirewareInternal 0x001665-0x0016AB (chip_type==1):
+   *   Sleep(2) → rst pulse#1 (low 7 ms → high) → Sleep(10)
+   *   → rst pulse#2 (low 7 ms → high) → Sleep(180) → probe.
+   * Without this the written firmware never executes (verified: chip
+   * stays silent after 05 FA + 04 FB unless hard-reset). */
+  FTE7001_INIT_COLD_FW_RST2MS,
+  FTE7001_INIT_COLD_FW_RST1_ASSERT,
+  FTE7001_INIT_COLD_FW_RST1_HOLD,
+  FTE7001_INIT_COLD_FW_RST1_DEASSERT,
+  FTE7001_INIT_COLD_FW_RST10MS,
+  FTE7001_INIT_COLD_FW_RST2_ASSERT,
+  FTE7001_INIT_COLD_FW_RST2_HOLD,
+  FTE7001_INIT_COLD_FW_RST2_DEASSERT,
+  FTE7001_INIT_COLD_FW_RST180MS,
+  /* Cold path: 10 EF 20 after firmware (Windows capture frame 60) */
+  FTE7001_INIT_COLD_FW_10EF20,
+  /* Cold path: sensor ID verify (0x14→0x58, 0x15→0x58) */
+  FTE7001_INIT_COLD_SENSOR_H,
+  FTE7001_INIT_COLD_SENSOR_L,
+  /* Shared config init: 11 EE 01 → 41 0F → 30 BB → 22 00 → 23 0E */
   FTE7001_INIT_WRITE_01,
   FTE7001_INIT_DELAY_01,
   FTE7001_INIT_WRITE_41,
@@ -415,15 +637,30 @@ fte7001_img_open (FpImageDevice *dev)
   self->spi_fd = open (spidev_path, O_RDWR);
   if (self->spi_fd < 0)
     {
+      /* Open failed before the SSM exists: the framework will not call
+       * img_close, so release the GPIO claimed above ourselves. */
+      fte7001_release_gpio (self);
       fpi_image_device_open_complete (dev,
         g_error_new (G_IO_ERROR, g_io_error_from_errno (errno),
                      "FTE7001: cannot open %s: %s", spidev_path,
                      g_strerror (errno)));
       return;
     }
-  fte7001_determine_spidev_speed (self);
+  if (!fte7001_determine_spidev_speed (self, &error))
+    {
+      close (self->spi_fd);
+      self->spi_fd = -1;
+      fte7001_release_gpio (self);
+      fpi_image_device_open_complete (dev, error);
+      return;
+    }
 
-  /* Start init SSM */
+  /* Start init SSM: universal first probe (90 00 00 → A-CUT detect),
+   * then branch warm/cold.  No 60 s window — cold boot detection is
+   * sub-millisecond, per the Windows reference capture (first frame → work state 4.14 s). */
+  self->cold_path = FALSE;
+  self->fe_round = 0;
+  self->chip_id = 0;
   {
     FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (dev), fte7001_init_handler, FTE7001_INIT_NSTATES);
     self->task_ssm = ssm;
@@ -498,44 +735,274 @@ fte7001_init_handler (FpiSsm *ssm, FpDevice *dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case FTE7001_INIT_RESET_ASSERT:
-      fte7001_set_hardware_reset (ssm, self, TRUE);
-      return;
-    case FTE7001_INIT_RESET_HOLD:
-      fpi_ssm_next_state_delayed (ssm, FT9338_RESET_PULSE_MS);
-      return;
-    case FTE7001_INIT_RESET_DEASSERT:
-      fte7001_set_hardware_reset (ssm, self, FALSE);
-      return;
-    case FTE7001_INIT_RESET_SETTLE:
-      fpi_ssm_next_state_delayed (ssm, 50);
-      return;
-    case FTE7001_INIT_WAKE_1:
-    case FTE7001_INIT_WAKE_2:
-      fte7001_submit_command (ssm, 0x70, TRUE);
-      return;
-    case FTE7001_INIT_WAKE_DELAY:
-      fpi_ssm_next_state_delayed (ssm, FT9338_RESET_DELAY_MS);
-      return;
-    case FTE7001_INIT_SETTLE:
-      fpi_ssm_next_state_delayed (ssm, FT9338_RESET_SETTLE_MS + 2);
-      return;
-    case FTE7001_INIT_READ_MCU:
+    /* --- Warm-probe preamble (Windows capture frames 1-11): 10EF20 + 70×4 + 10EF20/16/17 --- */
+    case FTE7001_INIT_PREAMBLE_10EF20_1:
+    case FTE7001_INIT_PREAMBLE_10EF20_2:
       fte7001_submit_reg_read (ssm, FT9338_REG_MCU_STATUS, 2, TRUE);
       return;
-    case FTE7001_INIT_CHECK_MCU:
-      /* Cold-booted chip may not be idle yet even with correct timing
-       * (P7-H: ROM firmware is already running; a non-idle MCU here is
-       * normal, not an error).  Downgrade to a warning and let config
-       * init finish waking it up; only INIT_CHECK_FINAL may demand idle. */
-      if (!fte7001_mcu_is_idle (self))
+    case FTE7001_INIT_PREAMBLE_70_1:
+    case FTE7001_INIT_PREAMBLE_70_2:
+    case FTE7001_INIT_PREAMBLE_70_3:
+    case FTE7001_INIT_PREAMBLE_70_4:
+      {
+        static const guint8 cmd70[1] = { 0x70 };
+        fte7001_submit_write_only (ssm, cmd70, 1);
+        return;
+      }
+    case FTE7001_INIT_PREAMBLE_10EF16:
+      fte7001_submit_reg_read (ssm, FT9338_REG_CHIP_ID_HIGH, 1, TRUE);
+      return;
+    case FTE7001_INIT_PREAMBLE_10EF17:
+      fte7001_submit_reg_read (ssm, FT9338_REG_CHIP_ID_LOW, 1, TRUE);
+      return;
+
+    /* --- Universal first probe: 90 00 00 → A-CUT detection (Windows cold-boot capture, 2026-10-06) --- */
+    case FTE7001_INIT_ACUT_DETECT:
+      fte7001_submit_acut_detect (ssm);
+      return;
+    case FTE7001_INIT_ACUT_CHECK:
+      if (self->small_rx_valid && self->small_rx[2] == 0xef)
         {
-          g_warning ("FT9338: MCU not idle right after wake (%02x %02x) — "
-                     "continuing with config init (P7-H)",
-                     self->small_rx[4], self->small_rx[5]);
+          self->cold_path = TRUE;
+          fp_dbg ("FT9338 A-CUT boot (EF) → cold path");
+          fpi_ssm_jump_to_state (ssm, FTE7001_INIT_COLD_RESET_ASSERT);
+          return;
         }
+      fpi_ssm_jump_to_state (ssm, FTE7001_INIT_WARM_READ_MCU);
+      return;
+
+    /* --- Warm path: chip already alive → MCU idle check --- */
+    case FTE7001_INIT_WARM_READ_MCU:
+      fte7001_submit_reg_read (ssm, FT9338_REG_MCU_STATUS, 2, TRUE);
+      return;
+    case FTE7001_INIT_WARM_CHECK_MCU:
+      if (fte7001_mcu_is_idle (self))
+        {
+          fp_dbg ("FT9338 warm path: MCU idle → skip cold");
+          fpi_ssm_jump_to_state (ssm, FTE7001_INIT_WRITE_01);
+          return;
+        }
+      /* Not idle → go cold */
+      fpi_ssm_jump_to_state (ssm, FTE7001_INIT_COLD_RESET_ASSERT);
+      return;
+
+    /* --- Cold: GPIO reset 10 ms → deassert → settle 50 ms --- */
+    case FTE7001_INIT_COLD_RESET_ASSERT:
+      fte7001_set_hardware_reset (ssm, self, TRUE);
+      return;
+    case FTE7001_INIT_COLD_RESET_HOLD:
+      fpi_ssm_next_state_delayed (ssm, FT9338_COLD_RESET_PULSE_MS);
+      return;
+    case FTE7001_INIT_COLD_RESET_DEASSERT:
+      fte7001_set_hardware_reset (ssm, self, FALSE);
+      return;
+    case FTE7001_INIT_COLD_SETTLE:
+      /* Windows sequence: deassert → immediately 55 AA, no settle delay. */
+      fpi_ssm_jump_to_state (ssm, FTE7001_INIT_COLD_55AA);
+      return;
+
+    /* --- Cold: 55 AA (command mode) → 0xFE existence check loop --- */
+    case FTE7001_INIT_COLD_55AA:
+      {
+        static const guint8 aa55[2] = { 0x55, 0xaa };
+        fte7001_submit_write_only (ssm, aa55, 2);
+        return;
+      }
+    case FTE7001_INIT_COLD_FE_CB_READ:
+      fte7001_submit_short_read (ssm, FT9338_REG_CB, TRUE);
+      return;
+    case FTE7001_INIT_COLD_FE_CB_WRITE:
+      fte7001_submit_short_write (ssm, FT9338_REG_CB, 0x20, TRUE);
+      return;
+    case FTE7001_INIT_COLD_FE_FD_WRITE:
+      fte7001_submit_short_write (ssm, FT9338_REG_FD, 0x11, TRUE);
+      return;
+    case FTE7001_INIT_COLD_FE_FE_WRITE:
+      fte7001_submit_short_write (ssm, FT9338_REG_FE, 0x11, TRUE);
+      return;
+    case FTE7001_INIT_COLD_FE_READ:
+      fte7001_submit_short_read (ssm, FT9338_REG_FE, TRUE);
+      return;
+    case FTE7001_INIT_COLD_FE_CHECK:
+      /* 08 F7 responses come in two flavours:
+       *   Real data:  rx[1]==0x00 rx[2]==0x00 rx[3]==<value>
+       *   Echo:       rx[1]==0x08 rx[2]==0xf7 rx[3]==<reg_byte>
+       * Reference capture round 4 was echo 'aa 08 f7 fe' — rx[3]==0xfe was fake.
+       * Discard echo before trusting FE != 0. */
+      fp_dbg ("FT9338 FE raw: %02x %02x %02x %02x (round %u)",
+              self->small_rx[0], self->small_rx[1],
+              self->small_rx[2], self->small_rx[3], self->fe_round + 1);
+      if (self->small_rx_valid
+          && self->small_rx[1] == 0x08 && self->small_rx[2] == 0xf7)
+        {
+          fp_dbg ("FT9338 FE=0x%02x (echo, discard)", self->small_rx[3]);
+          /* fall through to exhausted check below */
+        }
+      else if (self->small_rx_valid && self->small_rx[3] != 0)
+        {
+          fp_dbg ("FT9338 FE=0x%02x → chip has firmware, go warm",
+                  self->small_rx[3]);
+          fpi_ssm_jump_to_state (ssm, FTE7001_INIT_WRITE_01);
+          return;
+        }
+      if (self->fe_round >= FT9338_FE_CHECK_ROUNDS - 1)
+        {
+          fp_dbg ("FT9338 FE exhausted (%u rounds) → download",
+                  self->fe_round + 1);
+          fpi_ssm_jump_to_state (ssm, FTE7001_INIT_COLD_D0_RESET_ASSERT);
+          return;
+        }
+      fpi_ssm_jump_to_state (ssm, FTE7001_INIT_COLD_FE_DELAY);
+      return;
+    case FTE7001_INIT_COLD_FE_DELAY:
+      /* Continue FE loop without GPIO reset.  The 01 §5 pseudo-code
+       * reserves GPIO reset for step ② only (once, before 55 AA).
+       * Do NOT reset per round — keeping command mode across rounds
+       * is required for C2 identification to trigger. */
+      fpi_ssm_jump_to_state_delayed (ssm, FTE7001_INIT_COLD_55AA,
+                                     FT9338_FE_CHECK_DELAY_MS);
+      self->fe_round++;
+      return;
+
+    /* --- Cold: D0Entry GPIO reset (Windows D5-to-D0 power transition, before 10EF20) --- */
+    case FTE7001_INIT_COLD_D0_RESET_ASSERT:
+      fte7001_set_hardware_reset (ssm, self, TRUE);
+      return;
+    case FTE7001_INIT_COLD_D0_RESET_HOLD:
+      fpi_ssm_next_state_delayed (ssm, FT9338_COLD_RESET_PULSE_MS);
+      return;
+    case FTE7001_INIT_COLD_D0_RESET_DEASSERT:
+      fte7001_set_hardware_reset (ssm, self, FALSE);
+      return;
+
+    /* --- Cold: 10 EF 20 read + 70 wr ×2 alternation ×3 (Windows capture frames 43-48) --- */
+    case FTE7001_INIT_COLD_FW_10EF20_1:
+    case FTE7001_INIT_COLD_FW_10EF20_2:
+    case FTE7001_INIT_COLD_FW_10EF20_3:
+      fte7001_submit_reg_read (ssm, FT9338_REG_MCU_STATUS, 2, TRUE);
+      return;
+    case FTE7001_INIT_COLD_FW_70a_1:
+    case FTE7001_INIT_COLD_FW_70a_2:
+    case FTE7001_INIT_COLD_FW_70b_1:
+    case FTE7001_INIT_COLD_FW_70b_2:
+      {
+        static const guint8 cmd70[1] = { 0x70 };
+        fte7001_submit_write_only (ssm, cmd70, 1);
+        return;
+      }
+
+    /* --- Cold: 55 AA #6 firmware-branch entry (Windows capture frame 50) --- */
+    case FTE7001_INIT_COLD_FW_55AA:
+      {
+        static const guint8 aa55[2] = { 0x55, 0xaa };
+        fte7001_submit_write_only (ssm, aa55, 2);
+        return;
+      }
+
+    /* --- Cold: C2 identification (0x02 → FT9338) --- */
+    case FTE7001_INIT_COLD_C2_WRITE:
+      fte7001_submit_short_write (ssm, FT9338_REG_C2, 0x55, TRUE);
+      return;
+    case FTE7001_INIT_COLD_C2_READ:
+      fte7001_submit_short_read (ssm, FT9338_REG_C2, TRUE);
+      return;
+    case FTE7001_INIT_COLD_C2_CHECK:
+      fp_dbg ("FT9338 C2 raw: %02x %02x %02x %02x",
+              self->small_rx[0], self->small_rx[1],
+              self->small_rx[2], self->small_rx[3]);
+      /* Windows IC_EnterDownloadMode (0x1CE4) success criterion is
+       * readback == written value (0x55): confirms command mode.  The
+       * The Windows capture's "02 00 00 00" was stale small-frame buffer content,
+       * not this chip's answer.  Linux verified: 00 00 00 55 on success. */
+      if (!self->small_rx_valid || self->small_rx[3] != 0x55)
+        {
+          fpi_ssm_mark_failed (ssm,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+              "FT9338 C2 check failed: rx[3]=0x%02x (want 0x55)",
+              self->small_rx_valid ? self->small_rx[3] : 0xff));
+          return;
+        }
+      fp_dbg ("FT9338 C2=0x55 command mode confirmed");
       fpi_ssm_next_state (ssm);
       return;
+
+    /* --- Cold: download mode --- */
+    case FTE7001_INIT_COLD_DL_C8:
+      fte7001_submit_short_write (ssm, FT9338_REG_C8, 0xff, TRUE);
+      return;
+    case FTE7001_INIT_COLD_DL_CA:
+      fte7001_submit_short_write (ssm, FT9338_REG_CA, 0xff, TRUE);
+      return;
+    case FTE7001_INIT_COLD_DL_CB:
+      fte7001_submit_short_write (ssm, FT9338_REG_CB, 0xff, TRUE);
+      return;
+    case FTE7001_INIT_COLD_DL_B9A:
+      fte7001_submit_short_write (ssm, FT9338_REG_B9, 0xbf, TRUE);
+      return;
+    case FTE7001_INIT_COLD_DL_B9B:
+      fte7001_submit_short_write (ssm, FT9338_REG_B9, 0xff, TRUE);
+      return;
+
+    /* --- Cold: firmware 05 FA block write (write-only) --- */
+    case FTE7001_INIT_COLD_FW_WRITE:
+      fp_dbg ("FT9338 downloading firmware (%u B) …", FT9338_FW_BLOB_SIZE);
+      fte7001_submit_firmware_write (ssm);
+      return;
+
+    /* --- Cold: firmware 04 FB readback verify (full-duplex) --- */
+    case FTE7001_INIT_COLD_FW_READBACK:
+      fte7001_submit_firmware_readback (ssm);
+      return;
+
+    /* --- Cold: chip restart sequence (Windows 0x001665, chip_type==1) ---
+     * Sleep(2) → rst(7ms) → Sleep(10) → rst(7ms) → Sleep(180).
+     * The 04 FB readback leaves the chip in download mode; only this
+     * double hard-reset makes the freshly written firmware execute. */
+    case FTE7001_INIT_COLD_FW_RST2MS:
+      fpi_ssm_next_state_delayed (ssm, 2);
+      return;
+    case FTE7001_INIT_COLD_FW_RST1_ASSERT:
+      fte7001_set_hardware_reset (ssm, self, TRUE);
+      return;
+    case FTE7001_INIT_COLD_FW_RST1_HOLD:
+      fpi_ssm_next_state_delayed (ssm, FT9338_FW_RESTART_PULSE_MS);
+      return;
+    case FTE7001_INIT_COLD_FW_RST1_DEASSERT:
+      fte7001_set_hardware_reset (ssm, self, FALSE);
+      return;
+    case FTE7001_INIT_COLD_FW_RST10MS:
+      fpi_ssm_next_state_delayed (ssm, 10);
+      return;
+    case FTE7001_INIT_COLD_FW_RST2_ASSERT:
+      fte7001_set_hardware_reset (ssm, self, TRUE);
+      return;
+    case FTE7001_INIT_COLD_FW_RST2_HOLD:
+      fpi_ssm_next_state_delayed (ssm, FT9338_FW_RESTART_PULSE_MS);
+      return;
+    case FTE7001_INIT_COLD_FW_RST2_DEASSERT:
+      fte7001_set_hardware_reset (ssm, self, FALSE);
+      return;
+    case FTE7001_INIT_COLD_FW_RST180MS:
+      /* chip_type==1 (FT9338): Sleep(180) before probing */
+      fpi_ssm_next_state_delayed (ssm, FT9338_FW_BOOT_DELAY_MS);
+      return;
+
+    /* --- Cold: 10 EF 20 after firmware (Windows capture frame 60 — triggers download success) --- */
+    case FTE7001_INIT_COLD_FW_10EF20:
+      fte7001_submit_reg_read (ssm, FT9338_REG_MCU_STATUS, 2, TRUE);
+      return;
+
+    /* --- Cold: sensor ID sanity --- */
+    case FTE7001_INIT_COLD_SENSOR_H:
+      fte7001_submit_reg_read (ssm, FT9338_REG_SENSOR_ID_HIGH, 1, TRUE);
+      return;
+    case FTE7001_INIT_COLD_SENSOR_L:
+      if (self->small_rx_valid)
+        fp_dbg ("FT9338 sensor id high=0x%02x …",
+                fte7001_read_result_byte (self));
+      fte7001_submit_reg_read (ssm, FT9338_REG_SENSOR_ID_LOW, 1, TRUE);
+      return;
+    /* auto-advances to WRITE_01 */
     case FTE7001_INIT_WRITE_01:
       fte7001_submit_reg_write (ssm, 0x01, 0x01, TRUE);
       return;
@@ -603,7 +1070,15 @@ fte7001_init_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   self->task_ssm = NULL;
   if (error)
     {
+      /* Init failed: the framework will not call img_close after a
+       * failed open, so undo img_open's claims here (fd + GPIO). */
       self->idle_verified = FALSE;
+      if (self->spi_fd >= 0)
+        {
+          close (self->spi_fd);
+          self->spi_fd = -1;
+        }
+      fte7001_release_gpio (self);
       fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), error);
       return;
     }
@@ -804,6 +1279,20 @@ fpi_device_fte7001_init (FpiDeviceFte7001 *self)
   self->capture_tx[3] = 0x00;  /* addr low  */
   self->capture_tx[4] = 0x1e;  /* len high  */
   self->capture_tx[5] = 0x48;  /* len low   */
+
+  /* Firmware write buffer: 6 (header) + blob + 1 (tail 0x00) */
+  self->fw_write_buf = g_malloc0 (6 + FT9338_FW_BLOB_SIZE + 1);
+  self->fw_write_buf[0] = 0x05;       /* 05 FA */
+  self->fw_write_buf[1] = 0xFA;
+  self->fw_write_buf[2] = FT9338_FW_ADDR_HIGH;
+  self->fw_write_buf[3] = FT9338_FW_ADDR_LOW;
+  self->fw_write_buf[4] = 0x37;       /* len hi: 0x3738 = 14136 */
+  self->fw_write_buf[5] = 0x38;       /* len lo */
+  memcpy (self->fw_write_buf + 6, ft9338_firmware_blob, FT9338_FW_BLOB_SIZE);
+  self->fw_write_buf[6 + FT9338_FW_BLOB_SIZE] = 0x00;  /* tail */
+
+  /* Firmware readback RX buffer */
+  self->fw_readback_buf = g_malloc0 (FT9338_FW_READBACK_RX);
 }
 
 static void
@@ -816,6 +1305,8 @@ fpi_device_fte7001_finalize (GObject *object)
   fte7001_release_gpio (self);
   g_free (self->capture_tx);
   g_free (self->capture_rx);
+  g_free (self->fw_write_buf);
+  g_free (self->fw_readback_buf);
   fte7001_clear_captured_image (self);
 
   G_OBJECT_CLASS (fpi_device_fte7001_parent_class)->finalize (object);

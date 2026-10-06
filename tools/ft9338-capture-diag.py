@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FT9338 P6诊断: 钉死04FB锁门闸 — 最小间隙0x30+0x1D→04FB
+"""FT9338 capture diag: pin down the 04FB gate — 最小间隙0x30+0x1D→04FB
 用法: sudo python3 fte7001-diag-p6.py
 """
 import ctypes, fcntl, struct, os, time, sys, subprocess, hashlib
@@ -13,7 +13,7 @@ IMAGE_SIZE = 7744
 CAPTURE_SIZE = IMAGE_SIZE + 8  # 7752
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                   "产物-P6诊断-" + time.strftime("%Y%m%d-%H%M%S"))
+                   "产物-capture diag-" + time.strftime("%Y%m%d-%H%M%S"))
 os.makedirs(OUT, exist_ok=True)
 
 def log(s=""):
@@ -127,7 +127,7 @@ def start_prompt():
     with open(PROMPT_PATH, "w") as f:
         f.write("启动中...\n")
     p = as_user_bg("foot", "--app-id=fp-prompt", "--fullscreen",
-                   "--font=monospace:size=30", "--title=P6诊断",
+                   "--font=monospace:size=30", "--title=capture diag",
                    "bash", PROM_SH)
     if p is None:
         raise RuntimeError("foot 启动失败")
@@ -140,7 +140,7 @@ def close_prompt():
     as_user("pkill", "-f", "foot.*fp-prompt")
 
 # ===== main =====
-log("### P6诊断: 04FB锁门闸  %s" % time.strftime("%F %T"))
+log("### capture diag: 04FB锁门闸  %s" % time.strftime("%F %T"))
 log("### uptime=%ds" % float(open("/proc/uptime").read().split()[0]))
 log("### 产物: %s\n" % OUT)
 

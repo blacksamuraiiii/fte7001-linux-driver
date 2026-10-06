@@ -52,7 +52,7 @@
 #define FT9338_IRQ_FALLBACK_POLL_MS  50
 
 /* --- Timing constants (ms) --- */
-#define FT9338_RESET_PULSE_MS     20
+#define FT9338_RESET_PULSE_MS     20      /* warm/reset fallback */
 #define FT9338_RESET_DELAY_MS      6
 #define FT9338_RESET_SETTLE_MS     5
 #define FT9338_CONFIG_DELAY_MS     2
@@ -60,6 +60,14 @@
 #define FT9338_ARM_SETTLE_MS      10
 #define FT9338_POLL_DELAY_MS      50
 #define FT9338_FINGER_TIMEOUT_MS  20000
+
+/* Cold-boot timing (Windows cold-boot capture verified 2026-10-06) */
+#define FT9338_COLD_RESET_PULSE_MS   10   /* GPIO low pulse */
+#define FT9338_COLD_RESET_SETTLE_MS  50   /* after deassert */
+#define FT9338_FE_CHECK_ROUNDS        5   /* 0xFE existence check */
+#define FT9338_FE_CHECK_DELAY_MS     10   /* between rounds */
+#define FT9338_FW_WRITE_TIMEOUT_MS  2000  /* 05 FA ~640 ms */
+#define FT9338_FW_READBACK_TIMEOUT_MS 4000 /* 04 FB ~1.8 s */
 
 typedef struct
 {
@@ -77,6 +85,9 @@ const Fte7001GpioProfile *fpi_fte7001_lookup_gpio_profile (const gchar *sys_vend
 /* --- Register definitions --- */
 #define FT9338_REG_SENSOR_ID_HIGH  0x14
 #define FT9338_REG_SENSOR_ID_LOW   0x15
+#define FT9338_REG_CHIP_ID_HIGH    0x16  /* reads back 0x93 */
+#define FT9338_REG_CHIP_ID_LOW     0x17  /* reads back 0x38 */
+#define FT9338_CHIP_ID             0x9338
 #define FT9338_REG_FW_VERSION      0x1A
 #define FT9338_REG_AGC_VERSION     0x3C
 #define FT9338_REG_FINGER_STATUS   0x1D
@@ -92,6 +103,27 @@ const Fte7001GpioProfile *fpi_fte7001_lookup_gpio_profile (const gchar *sys_vend
 #define FT9338_REG_READ_HEADER_SIZE  4
 #define FT9338_REG_WRITE_SIZE        5
 #define FT9338_SMALL_FRAME_SIZE      20
+
+/* Cold-boot register addresses (08F7 / 09F6 short-config domain) */
+#define FT9338_REG_CB             0xCB
+#define FT9338_REG_C2             0xC2
+#define FT9338_REG_C8             0xC8
+#define FT9338_REG_CA             0xCA
+#define FT9338_REG_B9             0xB9
+#define FT9338_REG_FD             0xFD
+#define FT9338_REG_FE             0xFE
+
+/* Firmware download constants (Windows cold-boot capture verified 2026-10-06) */
+#define FT9338_FW_BLOB_SIZE        14136   /* 0x3738 */
+#define FT9338_FW_READBACK_TX_LEN  14138   /* blob_size + 2, header 0x373A */
+#define FT9338_FW_READBACK_RX      14144   /* tx_len + 6 (SPI 回执头) */
+#define FT9338_FW_ADDR_HIGH        0x00
+#define FT9338_FW_ADDR_LOW         0x00
+/* Chip restart after firmware download (Windows fn 0x29A0 + 0x001665,
+ * chip_type==1 branch, disassembly-verified 2026-10-06):
+ *   Sleep(2) → rst low 7ms → high → Sleep(10) → rst low 7ms → high → Sleep(180) */
+#define FT9338_FW_RESTART_PULSE_MS   7
+#define FT9338_FW_BOOT_DELAY_MS      180
 
 static const FpIdEntry fte7001_id_table[] = {
   {

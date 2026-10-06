@@ -1,0 +1,3 @@
+[submodule "libfprint-fte3600"]
+	path = libfprint-fte3600
+	url = https://github.com/SamSeven777/libfprint-fte3600

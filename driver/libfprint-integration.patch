@@ -1,28 +1,40 @@
 diff --git i/libfprint/meson.build w/libfprint/meson.build
-index 3aa29d4..4c37c70 100644
 --- i/libfprint/meson.build
 +++ w/libfprint/meson.build
-@@ -127,6 +127,7 @@ driver_sources = {
-         'drivers/fte3600-brisk.c',
-         'drivers/fte3600-template.c',
-     ),
+@@ -133,6 +133,7 @@
+     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
+     'elanspi' : files('drivers/elanspi.c'),
+     'fte3600' : fte3600_sources,
 +    'fte7001' : files('drivers/fte7001.c'),
      'nb1010' : files('drivers/nb1010.c'),
      'virtual_image' : files('drivers/virtual-image.c'),
      'virtual_device' : files('drivers/virtual-device.c'),
 diff --git i/meson.build w/meson.build
-index 8ed7905..d3c4da8 100644
 --- i/meson.build
 +++ w/meson.build
-@@ -148,9 +148,10 @@ drivers_info = {
+@@ -148,9 +148,10 @@
      'mafpmoc': {},
      'secugen': {},
- 
+
 -    # SPI drivers (fte3600 is optional/experimental)
 +    # SPI drivers (fte3600/fte7001 are optional/experimental)
      'elanspi': { 'spi': true, 'helper': ['udev'], 'optional': not have_spi },
-     'fte3600': { 'spi': true, 'helper': ['udev', 'gpiod'], 'optional': true },
+     'fte3600': { 'spi': true, 'helper': ['udev'], 'optional': true },
 +    'fte7001': { 'spi': true, 'helper': ['udev', 'gpiod'], 'optional': true },
- 
+
      # Virtual drivers (test-only, optional)
      'virtual_image': { 'virtual': true, 'helper': ['virtual'], 'optional': true },
+@@ -284,6 +285,14 @@
+         libfprint_conf.set10('HAVE_UDEV', true)
+
+         optional_deps += gudev_dep
++    elif i == 'gpiod'
++        gpiod_dep = dependency('libgpiod', version: '>= 2.0', required: false)
++        if not gpiod_dep.found()
++            error('libgpiod >= 2.0 is required for @0@ and possibly others'.format(driver))
++        endif
++
++        libfprint_conf.set10('HAVE_GPIOD', true)
++        optional_deps += gpiod_dep
+     endif
+ endforeach
