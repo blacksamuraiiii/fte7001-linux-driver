@@ -1,4 +1,20 @@
 // FT9338 cold-boot firmware blob, 14136 bytes
+//
+// PROPRIETARY FIRMWARE — NOT COVERED BY THE REPOSITORY LICENSE.
+//   Copyright (c) FocalTech Systems, Ltd.  All rights reserved.
+//
+//   This file is a RAM image of the FT9338 sensor firmware, captured from a
+//   FocalTech Windows driver cold-boot SPI transaction on hardware owned by
+//   the uploader (line capture, 2026-10).  It is redistributed here WITHOUT
+//   any licence, express or implied, from the copyright holder, for personal
+//   research / interoperability study of one's own device only.
+//
+//   The repository's LGPL-2.1-or-later licence covers the driver source code
+//   ONLY; this blob is exempt from it.  If you are not the owner of an
+//   FTE7001/FT9338 device, or you intend commercial use, do not use or
+//   redistribute this file.  FocalTech has enforced its firmware copyright by
+//   DMCA against a similar community redistribution before (ubuntu_spi, 2025).
+//
 // source: W2-raw/W2-05FA-payload-14136.bin
 // md5: 847a9beba432d162e06f891c4e59a16c
 static const guint8 ft9338_firmware_blob[14136] = {

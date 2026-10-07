@@ -1,9 +1,12 @@
 /*
  * FocalTech FTE7001 / FT9338 SPI fingerprint driver
  *
- * Based on fte3600.c.  FT9338 is a ROM-based, match-on-host sensor in the
- * same FocalTech 93xx family.  Key differences from FT9361:
- *   - ROM boots autonomously (no firmware upload)
+ * Based on fte3600.c.  FT9338 is a match-on-host sensor in the same
+ * FocalTech 93xx family.  Key differences from FT9361:
+ *   - RAM-loaded firmware: no on-chip boot ROM for the sensor stack.
+ *     After S5 power loss the chip sits in A-CUT boot and img_open()
+ *     downloads the 14136 B blob (05 FA), verifies it (04 FB), then
+ *     double-resets the chip to make it execute (2026-10-06).
  *   - No 0x76 CAPTURE_MODE register
  *   - 0x30 gate: read 0x30 (verify 0xBB) immediately before 04FB capture
  *   - Image: 88 x 88 = 7744 B  (vs. 64 x 80 = 5120 B)
@@ -80,14 +83,13 @@ struct _FpiDeviceFte7001
   struct gpiod_line_request *gpio_request;
 
   /* State */
-  gboolean          idle_verified;
-  gboolean          armed;
   guint             false_finger_count;
   FpiSsm           *task_ssm;
 
   /* Cold init */
   gboolean          cold_path;         /* TRUE when A-CUT boot detected */
   guint             fe_round;          /* FE check loop counter */
+  guint             warm_retries;      /* warm-path MCU idle re-reads before falling to cold */
   guint16           chip_id;
   guint8           *fw_write_buf;      /* 05 FA transfer buffer (header+blob+tail) */
   guint8           *fw_readback_buf;   /* 04 FB RX buffer */
@@ -100,32 +102,20 @@ G_DECLARE_FINAL_TYPE (FpiDeviceFte7001, fpi_device_fte7001, FPI, DEVICE_FTE7001,
 G_DEFINE_TYPE (FpiDeviceFte7001, fpi_device_fte7001, FP_TYPE_IMAGE_DEVICE)
 
 /* ----- helpers ----- */
-static inline gboolean
-fte7001_acpi_path_equal (const gchar *path_a, const gchar *path_b)
-{
-  /* Urgent ACPI path comparison: normalised names, unequal lengths
-   * always differ, and strings must match after that normalisation. */
-  guint ia = 0, ib = 0;
-
-  if (!path_a || !path_b) return FALSE;
-  while (path_a[ia] == '\\') ia++;
-  while (path_b[ib] == '\\') ib++;
-
-  while (path_a[ia] && path_b[ib])
-    {
-      if (path_a[ia] == '\\') { ia++; continue; }
-      if (path_b[ib] == '\\') { ib++; continue; }
-      if (g_ascii_toupper (path_a[ia]) != g_ascii_toupper (path_b[ib]))
-        return FALSE;
-      ia++; ib++;
-    }
-  return path_a[ia] == path_b[ib];
-}
-
 static guint8
 fte7001_read_result_byte (FpiDeviceFte7001 *self)
 {
   return self->small_rx[FT9338_REG_READ_HEADER_SIZE];
+}
+
+/* TRUE if any byte in buf[:len] is non-zero (suspend detection). */
+static inline gboolean
+fte7001_buf_has_data (const guint8 *buf, gsize len)
+{
+  for (gsize i = 0; i < len; i++)
+    if (buf[i] != 0)
+      return TRUE;
+  return FALSE;
 }
 
 static gboolean
@@ -374,7 +364,6 @@ fte7001_set_hardware_reset (FpiSsm *ssm, FpiDeviceFte7001 *self, gboolean assert
 
   /* GPIO 85 is active-low: raw 0 = assert reset */
   value = asserted ? GPIOD_LINE_VALUE_INACTIVE : GPIOD_LINE_VALUE_ACTIVE;
-  self->idle_verified = FALSE;
   if (gpiod_line_request_set_value (self->gpio_request,
                                     self->gpio_profile->reset_offset, value) < 0)
     {
@@ -570,9 +559,14 @@ enum fte7001_init_state {
   FTE7001_INIT_COLD_DL_CB,
   FTE7001_INIT_COLD_DL_B9A,
   FTE7001_INIT_COLD_DL_B9B,
-  /* Cold path: firmware 05 FA write + 04 FB readback */
+  /* Cold path: firmware 05 FA write + 04 FB readback + content check */
   FTE7001_INIT_COLD_FW_WRITE,
   FTE7001_INIT_COLD_FW_READBACK,
+  /* Verify the 04 FB payload byte-for-byte against the blob.  The frame
+   * carries a 6-byte receipt header, so the blob start offset varies:
+   * locate it by matching the first 64 blob bytes within the first 16 RX
+   * bytes, then memcmp the whole blob (same approach as fp-unlock.py). */
+  FTE7001_INIT_COLD_FW_READBACK_CHECK,
   /* Cold path: chip restart after firmware download.
    * Windows DownLoadFirewareInternal 0x001665-0x0016AB (chip_type==1):
    *   Sleep(2) → rst pulse#1 (low 7 ms → high) → Sleep(10)
@@ -590,10 +584,22 @@ enum fte7001_init_state {
   FTE7001_INIT_COLD_FW_RST180MS,
   /* Cold path: 10 EF 20 after firmware (Windows capture frame 60) */
   FTE7001_INIT_COLD_FW_10EF20,
-  /* Cold path: sensor ID verify (0x14→0x58, 0x15→0x58) */
+  /* Cold path: sensor ID verify (0x14→0x58, 0x15→0x58, hard check).
+   * Values are read at RX[4] (FT9338_REG_READ_HEADER_SIZE): the Windows
+   * driver's ctx default is 0x5858 (movw $0x5858 @0x180002e2e), and the
+   * P5-G wire capture shows 10 EF 15 → RX 58 10 93 93 58 (RX[4]=0x58). */
   FTE7001_INIT_COLD_SENSOR_H,
   FTE7001_INIT_COLD_SENSOR_L,
-  /* Shared config init: 11 EE 01 → 41 0F → 30 BB → 22 00 → 23 0E */
+  FTE7001_INIT_COLD_SENSOR_CHECK,
+  /* Shared config init: 11 EE 01 → 41 0F → 30 BB → 22 00 → 23 0E.
+   * WARM-ONLY GATE: when the marker already reads 0xBB the chip is armed
+   * and rewriting the config registers destroys the finger-ready status
+   * (RX[4] of 0x1D never reaches 0x01 afterwards — verified 2026-10-07:
+   * two fprintd-enroll runs deadlocked exactly here while the production
+   * fp-unlock.py path, which skips these writes when 0x30==0xBB, captures
+   * fine).  So: read 0x30 first; already 0xBB → jump straight to ARM. */
+  FTE7001_INIT_GATE_READ_30,
+  FTE7001_INIT_GATE_CHECK_30,
   FTE7001_INIT_WRITE_01,
   FTE7001_INIT_DELAY_01,
   FTE7001_INIT_WRITE_41,
@@ -660,6 +666,7 @@ fte7001_img_open (FpImageDevice *dev)
    * sub-millisecond, per the Windows reference capture (first frame → work state 4.14 s). */
   self->cold_path = FALSE;
   self->fe_round = 0;
+  self->warm_retries = 0;
   self->chip_id = 0;
   {
     FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (dev), fte7001_init_handler, FTE7001_INIT_NSTATES);
@@ -680,8 +687,6 @@ fte7001_img_close (FpImageDevice *dev)
       close (self->spi_fd);
       self->spi_fd = -1;
     }
-  self->idle_verified = FALSE;
-  self->armed = FALSE;
   fpi_image_device_close_complete (dev, NULL);
 }
 
@@ -696,8 +701,14 @@ enum fte7001_capture_state {
   FTE7001_CAPTURE_ARM_SETTLE,
   FTE7001_CAPTURE_POLL_5B,
   FTE7001_CAPTURE_CHECK_5B,
-  FTE7001_CAPTURE_POLL_16B,
-  FTE7001_CAPTURE_CHECK_16B,
+  /* Soft wake pair (0x70 ×2, 6 ms apart) injected when the chip suspends
+   * in the wait loop; then back to POLL_5B. */
+  FTE7001_CAPTURE_SOFT_WAKE_1,
+  /* Two-frame confirmation of the finger signal (kills ARM-adjacent
+   * glitch false positives) + suspend watchdog lives in CHECK_5B. */
+  FTE7001_CAPTURE_CONFIRM_FINGER_1,
+  FTE7001_CAPTURE_CONFIRM_FINGER_2,
+  FTE7001_CAPTURE_CONFIRM_FINGER_CHECK,
   FTE7001_CAPTURE_GATE_READ_30,
   FTE7001_CAPTURE_GATE_CHECK_30,
   FTE7001_CAPTURE_READ_IMAGE,
@@ -705,6 +716,8 @@ enum fte7001_capture_state {
   FTE7001_CAPTURE_CLEANUP_READ_20,
   FTE7001_CAPTURE_CLEANUP_WRITE_54,
   FTE7001_CAPTURE_CLEANUP_READ_20B,
+  FTE7001_CAPTURE_REPORT_OFF,
+  FTE7001_CAPTURE_CLEANUP_LOOP,
   FTE7001_CAPTURE_DONE,
   FTE7001_CAPTURE_NSTATES,
 };
@@ -779,10 +792,24 @@ fte7001_init_handler (FpiSsm *ssm, FpDevice *dev)
       if (fte7001_mcu_is_idle (self))
         {
           fp_dbg ("FT9338 warm path: MCU idle → skip cold");
-          fpi_ssm_jump_to_state (ssm, FTE7001_INIT_WRITE_01);
+          self->warm_retries = 0;
+          fpi_ssm_jump_to_state (ssm, FTE7001_INIT_GATE_READ_30);
           return;
         }
-      /* Not idle → go cold */
+      /* Single-frame non-idle is common while the chip is still in its
+       * power-on transition (D-Bus activation timing is unpredictable).
+       * Re-read a couple of times before paying the ~4 s cold sequence —
+       * the cold path has A-CUT/second-reset fallbacks, so safety holds. */
+      if (self->warm_retries < FT9338_WARM_RETRY_MAX)
+        {
+          self->warm_retries++;
+          fp_dbg ("FT9338 warm path: MCU not idle, retry %u/%u",
+                  self->warm_retries, FT9338_WARM_RETRY_MAX);
+          fpi_ssm_jump_to_state_delayed (ssm, FTE7001_INIT_WARM_READ_MCU,
+                                         FT9338_WARM_RETRY_DELAY_MS);
+          return;
+        }
+      /* Not idle after retries → go cold */
       fpi_ssm_jump_to_state (ssm, FTE7001_INIT_COLD_RESET_ASSERT);
       return;
 
@@ -842,7 +869,7 @@ fte7001_init_handler (FpiSsm *ssm, FpDevice *dev)
         {
           fp_dbg ("FT9338 FE=0x%02x → chip has firmware, go warm",
                   self->small_rx[3]);
-          fpi_ssm_jump_to_state (ssm, FTE7001_INIT_WRITE_01);
+          fpi_ssm_jump_to_state (ssm, FTE7001_INIT_GATE_READ_30);
           return;
         }
       if (self->fe_round >= FT9338_FE_CHECK_ROUNDS - 1)
@@ -954,6 +981,44 @@ fte7001_init_handler (FpiSsm *ssm, FpDevice *dev)
       fte7001_submit_firmware_readback (ssm);
       return;
 
+    case FTE7001_INIT_COLD_FW_READBACK_CHECK:
+    {
+      gsize off;
+      gboolean found = FALSE;
+
+      /* The upper bound is derived from the remaining length, NOT a fixed
+       * window: off must satisfy off + BLOB_SIZE <= READBACK_RX so the
+       * full-length memcmp below can never run past the buffer end
+       * (off <= 14144 - 14136 = 8; the old `off < 16` allowed a
+       * 7-byte heap overread, fixed 2026-10-07). */
+      for (off = 0; off + FT9338_FW_BLOB_SIZE <= FT9338_FW_READBACK_RX;
+           off++)
+        {
+          if (memcmp (self->fw_readback_buf + off,
+                      ft9338_firmware_blob, 64) == 0)
+            {
+              found = TRUE;
+              break;
+            }
+        }
+      if (!found ||
+          memcmp (self->fw_readback_buf + off, ft9338_firmware_blob,
+                  FT9338_FW_BLOB_SIZE) != 0)
+        {
+          /* Wipe either way: the buffer holds a full firmware copy. */
+          memset (self->fw_readback_buf, 0, FT9338_FW_READBACK_RX);
+          fpi_ssm_mark_failed (ssm,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+              "FT9338 firmware readback mismatch (blob not found in first 16 B)"));
+          return;
+        }
+      memset (self->fw_readback_buf, 0, FT9338_FW_READBACK_RX);
+      fp_dbg ("FT9338 firmware readback verified (%u B @ offset %u)",
+              FT9338_FW_BLOB_SIZE, (guint) off);
+      fpi_ssm_next_state (ssm);
+      return;
+    }
+
     /* --- Cold: chip restart sequence (Windows 0x001665, chip_type==1) ---
      * Sleep(2) → rst(7ms) → Sleep(10) → rst(7ms) → Sleep(180).
      * The 04 FB readback leaves the chip in download mode; only this
@@ -997,14 +1062,59 @@ fte7001_init_handler (FpiSsm *ssm, FpDevice *dev)
       fte7001_submit_reg_read (ssm, FT9338_REG_SENSOR_ID_HIGH, 1, TRUE);
       return;
     case FTE7001_INIT_COLD_SENSOR_L:
-      if (self->small_rx_valid)
-        fp_dbg ("FT9338 sensor id high=0x%02x …",
-                fte7001_read_result_byte (self));
+    {
+      guint8 id_high = fte7001_read_result_byte (self);
+
+      if (!self->small_rx_valid || id_high != FT9338_SENSOR_ID_HIGH)
+        {
+          fpi_ssm_mark_failed (ssm,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+              "FT9338 sensor ID high mismatch: 0x%02x (expected 0x%02x)",
+              self->small_rx_valid ? id_high : 0xff,
+              FT9338_SENSOR_ID_HIGH));
+          return;
+        }
       fte7001_submit_reg_read (ssm, FT9338_REG_SENSOR_ID_LOW, 1, TRUE);
       return;
-    /* auto-advances to WRITE_01 */
+    }
+    case FTE7001_INIT_COLD_SENSOR_CHECK:
+    {
+      guint8 id_low = fte7001_read_result_byte (self);
+
+      if (!self->small_rx_valid || id_low != FT9338_SENSOR_ID_LOW)
+        {
+          fpi_ssm_mark_failed (ssm,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+              "FT9338 sensor ID low mismatch: 0x%02x (expected 0x%02x)",
+              self->small_rx_valid ? id_low : 0xff,
+              FT9338_SENSOR_ID_LOW));
+          return;
+        }
+      fp_dbg ("FT9338 sensor ID verified: 0x%02x 0x%02x",
+              FT9338_SENSOR_ID_HIGH, FT9338_SENSOR_ID_LOW);
+      fpi_ssm_next_state (ssm);
+      return;
+    }
     case FTE7001_INIT_WRITE_01:
       fte7001_submit_reg_write (ssm, 0x01, 0x01, TRUE);
+      return;
+    case FTE7001_INIT_GATE_READ_30:
+      fte7001_submit_reg_read (ssm, FT9338_REG_CONFIG_MARKER, 1, TRUE);
+      return;
+    case FTE7001_INIT_GATE_CHECK_30:
+      if (fte7001_read_result_byte (self) == 0xbb)
+        {
+          /* Marker already set: rewriting config kills the finger-ready
+           * status (2026-10-07).  Finish INIT here — the capture SSM
+           * performs exactly the production ARM order (1F → 1E) in its
+           * first states, which is all an armed chip needs. */
+          fp_dbg ("FT9338 0x30 already 0xBB → skip config rewrite");
+          fpi_ssm_jump_to_state (ssm, FTE7001_INIT_DONE);
+          return;
+        }
+      fp_dbg ("FT9338 0x30=0x%02x → full config init",
+              fte7001_read_result_byte (self));
+      fpi_ssm_next_state (ssm);
       return;
     case FTE7001_INIT_DELAY_01:
     case FTE7001_INIT_DELAY_41:
@@ -1051,7 +1161,6 @@ fte7001_init_handler (FpiSsm *ssm, FpDevice *dev)
               self->small_rx[4], self->small_rx[5]));
           return;
         }
-      self->idle_verified = TRUE;
       fpi_ssm_next_state (ssm);
       return;
     case FTE7001_INIT_DONE:
@@ -1072,7 +1181,6 @@ fte7001_init_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
     {
       /* Init failed: the framework will not call img_close after a
        * failed open, so undo img_open's claims here (fd + GPIO). */
-      self->idle_verified = FALSE;
       if (self->spi_fd >= 0)
         {
           close (self->spi_fd);
@@ -1117,39 +1225,88 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
               "FT9338 timed out waiting for finger"));
           return;
         }
-      /* 5B short frame: single result byte = image-ready signal. */
+      /* 5B short frame — the ONLY frame allowed in the finger-wait loop
+       * (Windows wire capture: 26/26 wait-phase reads are 5B; a 16B read
+       * here kills the waiting MCU, verified 2026-10-07). */
       fte7001_submit_reg_read (ssm, FT9338_REG_FINGER_STATUS, 1, TRUE);
       return;
     case FTE7001_CAPTURE_CHECK_5B:
-      /* Windows ISR criterion: RX[4] == 0x01 (or 0xA0) = image RAM ready.
-       * NOT RX[2:3] == 11 11 (that only means the finger is physically
-       * present — capturing then reads an empty image). */
+    {
+      static const guint8 cmd70[1] = { 0x70 };
+
+      /* Finger presence criteria (Linux-verified 2026-10-07):
+       *   - RX[4] == 0x01/0xA0: image-RAM-ready.  Windows ISR criterion —
+       *     only reliable in a narrow window right after ARM; disappears
+       *     once the chip settles (production unlock + instrumented runs
+       *     both show it never firing while 11 11 is solid).
+       *   - RX[2:3] == 11 11: finger physically present.  The one signal
+       *     that reliably appears in EVERY Linux capture session.
+       * Either means "go capture now" — confirmed by a second frame below
+       * (ARM-adjacent residual frames can fake the signal). */
       finger_status =
-        self->small_rx[4] == 0x01 || self->small_rx[4] == 0xa0;
+        self->small_rx[4] == 0x01 || self->small_rx[4] == 0xa0 ||
+        (self->small_rx[2] == 0x11 && self->small_rx[3] == 0x11);
       g_debug ("FT9338 0x1D 5B: %02x %02x %02x %02x %02x  ready=%d",
                self->small_rx[0], self->small_rx[1], self->small_rx[2],
                self->small_rx[3], self->small_rx[4], finger_status);
       if (finger_status)
         {
+          /* Two-frame confirmation: re-read after 60 ms and require the
+           * same verdict — kills ARM-adjacent glitch false positives
+           * (production fp-unlock.py practice, verified 2026-10-07). */
           self->false_finger_count = 0;
+          fpi_ssm_next_state (ssm);   /* → CONFIRM_FINGER */
+          return;
+        }
+      /* Suspend watchdog: ~1.6 s after ARM with no touch the chip drops
+       * to the all-zero suspend state that 0x1D polling cannot wake
+       * (measured: 15 s / 284 frames still all-zero).  20 all-zero
+       * frames ≈ 1 s → inject a 0x70 ×2 soft wake (write-only, the
+       * production chain's wake idiom), then keep polling 5B. */
+      if (self->small_rx_valid &&
+          !fte7001_buf_has_data (self->small_rx, 5))
+        self->false_finger_count++;
+      else
+        self->false_finger_count = 0;
+      if (self->false_finger_count >= FT9338_SUSPEND_WAKE_FRAMES)
+        {
+          self->false_finger_count = 0;
+          fp_dbg ("FT9338 wait loop: %u all-zero frames → 0x70 soft wake",
+                  FT9338_SUSPEND_WAKE_FRAMES);
+          fte7001_submit_write_only (ssm, cmd70, 1);
+          return;
+        }
+      fpi_ssm_jump_to_state_delayed (ssm, FTE7001_CAPTURE_POLL_5B,
+                                     FT9338_IRQ_FALLBACK_POLL_MS);
+      return;
+    }
+    case FTE7001_CAPTURE_SOFT_WAKE_1:
+    {
+      /* Second 0x70 of the wake pair (production idiom is 0x70 ×2 with
+       * a 6 ms gap).  On completion the SSM advances to CONFIRM_FINGER_1,
+       * whose 60 ms delay doubles as the post-wake settle time; the
+       * confirmation read then either sees a finger or falls back to
+       * the 5B poll loop. */
+      static const guint8 cmd70[1] = { 0x70 };
+      fte7001_submit_write_only (ssm, cmd70, 1);
+      return;
+    }
+    case FTE7001_CAPTURE_CONFIRM_FINGER_1:
+      fpi_ssm_next_state_delayed (ssm, 60);
+      return;
+    case FTE7001_CAPTURE_CONFIRM_FINGER_2:
+      fte7001_submit_reg_read (ssm, FT9338_REG_FINGER_STATUS, 1, TRUE);
+      return;
+    case FTE7001_CAPTURE_CONFIRM_FINGER_CHECK:
+      if (self->small_rx[4] == 0x01 || self->small_rx[4] == 0xa0 ||
+          (self->small_rx[2] == 0x11 && self->small_rx[3] == 0x11))
+        {
           fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
           fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_GATE_READ_30);
           return;
         }
-      /* Not ready → 16B read keeps the MCU alive, then poll again. */
-      fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_POLL_16B);
-      return;
-    case FTE7001_CAPTURE_POLL_16B:
-      /* 16B long frame.  FT9338's 0x1D register kills the MCU when polled
-       * with a single frame format (5B or 16B alone → all-zero after 2-3
-       * reads).  Alternating 5B/16B keeps it alive; this read is the
-       * "antidote" and its payload is not used for detection. */
-      fte7001_submit_reg_read (ssm, FT9338_REG_FINGER_STATUS, 12, TRUE);
-      return;
-    case FTE7001_CAPTURE_CHECK_16B:
-      self->false_finger_count++;
-      fpi_ssm_jump_to_state_delayed (ssm, FTE7001_CAPTURE_POLL_5B,
-                                     FT9338_IRQ_FALLBACK_POLL_MS);
+      /* Glitch — back to the poll loop. */
+      fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_POLL_5B);
       return;
 
     case FTE7001_CAPTURE_GATE_READ_30:
@@ -1159,10 +1316,12 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
     case FTE7001_CAPTURE_GATE_CHECK_30:
       if (fte7001_read_result_byte (self) != 0xbb)
         {
-          fpi_ssm_mark_failed (ssm,
-            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-              "FT9338 config marker lost before capture (%02x)",
-              fte7001_read_result_byte (self)));
+          /* Marker lost while the finger was down (chip dropped out of
+           * armed state during the poll).  Re-ARM once instead of failing
+           * the whole action — the next poll cycle re-detects the finger. */
+          fp_dbg ("FT9338 config marker lost before capture (%02x) → re-ARM",
+                  fte7001_read_result_byte (self));
+          fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_ARM_1F);
           return;
         }
       fpi_ssm_next_state (ssm);
@@ -1184,7 +1343,17 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
 
       /* Secure-clear the raw SPI buffer */
       memset (self->capture_rx, 0, FT9338_CAPTURE_FRAME_SIZE);
-      fpi_ssm_next_state (ssm);
+      /* Hand the image over FIRST (framework: CAPTURE→AWAIT_FINGER_OFF,
+       * minutiae starts async).  While the framework is busy we run the
+       * ReturnAutoPower cleanup so the sensor is re-armed BEFORE we
+       * report finger-off.  Only then report off: the framework may
+       * immediately deactivate (identify completes → auto-deactivate),
+       * and at that point every SPI transfer has already finished —
+       * no in-flight transfer gets cancelled mid-sequence, which is
+       * what corrupted the previous attempts (2026-10-07). */
+      fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev),
+                                       g_steal_pointer (&self->captured_image));
+      fpi_ssm_next_state (ssm);   /* → CLEANUP (ReturnAutoPower) */
       return;
 
     case FTE7001_CAPTURE_CLEANUP_READ_20:
@@ -1196,6 +1365,33 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
       return;
     case FTE7001_CAPTURE_CLEANUP_READ_20B:
       fte7001_submit_reg_read (ssm, FT9338_REG_MCU_STATUS, 2, TRUE);
+      return;
+    case FTE7001_CAPTURE_REPORT_OFF:
+      /* Cleanup done and sensor re-armed — NOW tell the framework the
+       * finger is off.  It may deactivate us immediately (identify
+       * auto-deactivate); we are idle, so cancellation is harmless. */
+      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
+      fpi_ssm_next_state (ssm);
+      return;
+    case FTE7001_CAPTURE_CLEANUP_LOOP:
+      /* Branch on the current action (framework contract, fpi-image-device.c):
+       *   ENROLL  → keep polling for the next touch (the framework stays
+       *             active and waits for the next finger-on report).
+       *   IDENTIFY/VERIFY/CAPTURE → the framework deactivates as soon as
+       *             the finger-off report lands (maybe_complete_action →
+       *             identify_complete).  Restarting the poll here races
+       *             the cancellation and fails the whole session with
+       *             G_IO_ERROR_CANCELLED (2026-10-07) — so just complete
+       *             the SSM and let deactivate take over. */
+      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
+        {
+          if (fte7001_fail_if_cancelled (ssm, dev)) return;
+          self->capture_deadline =
+            g_get_monotonic_time () + (gint64) FT9338_FINGER_TIMEOUT_MS * 1000;
+          fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_POLL_5B);
+          return;
+        }
+      fpi_ssm_next_state (ssm);   /* → DONE */
       return;
 
     case FTE7001_CAPTURE_DONE:
@@ -1212,19 +1408,31 @@ fte7001_capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (dev);
 
   self->task_ssm = NULL;
+  /* Images are handed over inside PROCESS_IMAGE while the SSM keeps
+   * polling, so reaching here means the SSM ended outside the happy
+   * loop: finger-wait timeout, cancellation (deactivate) or a hard
+   * error.  Map them the standard way (elan shape, 2026-10-07). */
   if (self->captured_image)
     {
-      /* image_captured takes ownership of img; do NOT unref again. */
-      FpImage *img = g_steal_pointer (&self->captured_image);
-      fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev), img);
+      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
+      fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev),
+                                       g_steal_pointer (&self->captured_image));
+      return;
     }
-  else
+  if (!error)
+    return;                     /* e.g. cancelled transfer — deactivate will clean up */
+  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
     {
-      fpi_image_device_session_error (FP_IMAGE_DEVICE (dev),
-        error ? g_error_copy (error) :
-        fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-          "FT9338 capture produced no image"));
+      /* Nobody touched the sensor in FT9338_FINGER_TIMEOUT_MS — tell the
+       * framework and let it re-activate when it cares again. */
+      fpi_image_device_retry_scan (FP_IMAGE_DEVICE (dev),
+                                    FP_DEVICE_RETRY_TOO_SHORT);
+      return;
     }
+  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    return;                     /* deactivation path — nothing to report */
+  fpi_image_device_session_error (FP_IMAGE_DEVICE (dev),
+                                  g_error_copy (error));
 }
 
 static void
@@ -1253,14 +1461,14 @@ fte7001_activate (FpImageDevice *dev)
 static void
 fte7001_deactivate (FpImageDevice *dev)
 {
-  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (dev);
-
-  if (self->task_ssm)
-    {
-      GCancellable *cancellable = fpi_device_get_cancellable (FP_DEVICE (dev));
-      if (cancellable)
-        g_cancellable_cancel (cancellable);
-    }
+  /* Do NOT cancel the action cancellable here.  The framework cancels it
+   * itself when an external stop arrives, and fpi_image_device_
+   * deactivate_complete() → maybe_complete_action() relies on
+   * g_cancellable_set_error_if_cancelled() to produce the correct final
+   * status — cancelling it from the driver turns every successful
+   * identify/enroll into G_IO_ERROR_CANCELLED (the "enroll-failed after
+   * first touch" killer, 2026-10-07).  The poll loop exits gracefully
+   * via fte7001_fail_if_cancelled() on the next iteration. */
   fpi_image_device_deactivate_complete (dev, NULL);
 }
 

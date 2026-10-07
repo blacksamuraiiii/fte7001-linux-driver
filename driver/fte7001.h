@@ -1,9 +1,10 @@
 /*
  * FocalTech FTE7001 / FT9338 SPI fingerprint driver
  *
- * Based on fte3600.c (FT9361).  The FT9338 is a ROM-based device from the
- * same FocalTech 93xx family.  Key differences from FT9361:
- *   - No firmware upload (ROM boots autonomously)
+ * Based on fte3600.c (FT9361).  The FT9338 is a RAM-loaded-firmware device
+ * from the same FocalTech 93xx family.  Key differences from FT9361:
+ *   - Firmware is downloaded to RAM on cold boot (05 FA 14136 B + 04 FB
+ *     verify + double reset, 2026-10-06); S5 power loss clears it
  *   - No 0x76 CAPTURE_MODE register
  *   - 0x30 gate: read 0x30 (verify 0xBB) immediately before 04FB capture
  *   - Image: 88 x 88 = 7744 B (vs. 64 x 80 = 5120 B)
@@ -50,7 +51,6 @@
 #define FT9338_IMAGE_PPMM      20.0  /* 508 DPI */
 
 #define FT9338_IRQ_FALLBACK_POLL_MS  50
-
 /* --- Timing constants (ms) --- */
 #define FT9338_RESET_PULSE_MS     20      /* warm/reset fallback */
 #define FT9338_RESET_DELAY_MS      6
@@ -66,8 +66,9 @@
 #define FT9338_COLD_RESET_SETTLE_MS  50   /* after deassert */
 #define FT9338_FE_CHECK_ROUNDS        5   /* 0xFE existence check */
 #define FT9338_FE_CHECK_DELAY_MS     10   /* between rounds */
-#define FT9338_FW_WRITE_TIMEOUT_MS  2000  /* 05 FA ~640 ms */
-#define FT9338_FW_READBACK_TIMEOUT_MS 4000 /* 04 FB ~1.8 s */
+#define FT9338_WARM_RETRY_MAX         2   /* MCU idle re-reads before cold path */
+#define FT9338_WARM_RETRY_DELAY_MS  150   /* between warm re-reads */
+#define FT9338_SUSPEND_WAKE_FRAMES   20   /* all-zero 5B frames (~1 s) before 0x70 soft wake */
 
 typedef struct
 {
@@ -115,8 +116,7 @@ const Fte7001GpioProfile *fpi_fte7001_lookup_gpio_profile (const gchar *sys_vend
 
 /* Firmware download constants (Windows cold-boot capture verified 2026-10-06) */
 #define FT9338_FW_BLOB_SIZE        14136   /* 0x3738 */
-#define FT9338_FW_READBACK_TX_LEN  14138   /* blob_size + 2, header 0x373A */
-#define FT9338_FW_READBACK_RX      14144   /* tx_len + 6 (SPI 回执头) */
+#define FT9338_FW_READBACK_RX      14144   /* blob + 6-byte SPI receipt header */
 #define FT9338_FW_ADDR_HIGH        0x00
 #define FT9338_FW_ADDR_LOW         0x00
 /* Chip restart after firmware download (Windows fn 0x29A0 + 0x001665,

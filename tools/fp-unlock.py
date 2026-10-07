@@ -261,12 +261,19 @@ def init_and_arm():
     return True
 
 def wait_finger(timeout=10):
-    """轮询 0x1D（10EF 5B 读，#8 值在 RX[4]）。0x01/0xA0=手指就绪。"""
+    """轮询 0x1D（10EF 5B 读，#8 值在 RX[4]）。0x01/0xA0=图像 RAM 就绪。
+    2026-10-07 回归教训：本函数曾加「16B 长帧保活」——实测该帧在等待态
+    会把 MCU 打挂（挂起后 0x1D 无响应，按手指全零超时），已回滚。
+    保留双帧确认（60ms 复读一致才触发），消挂起唤醒毛刺假阳性。"""
     t0 = time.time()
     while time.time() - t0 < timeout:
         r5 = xfer([0x10, 0xEF, 0x1D, 0x00, 0x00], 5)
         if r5[4] == 0x01 or r5[4] == 0xa0:
-            return True
+            time.sleep(0.06)
+            r5b = xfer([0x10, 0xEF, 0x1D, 0x00, 0x00], 5)
+            if r5b[4] == 0x01 or r5b[4] == 0xa0:
+                return True
+            continue  # 假信号，重置判定
         time.sleep(0.05)
     return False
 
@@ -351,41 +358,53 @@ def main():
         log("另一个实例运行中, 跳过")
         sys.exit(1)  # 已有实例在跑，立即退出
     try:
-        if not os.path.exists(TPL):
-            log("NO_TEMPLATE")
-            print("NO_TEMPLATE"); sys.exit(2)
-        tpl, tw, th = read_pgm_pixels(TPL)
-        assert tw == W and th == H
-
-        log("start threshold=%.2f" % threshold)
-        sys.stdout.write("ready..."); sys.stdout.flush()
-
-        setup_spi()
-
-        # (可选) 读 ID/FW 探活确认固件在跑
-        rid = rd10ef(0x14)
-        if rid[4] != 0x58:
-            log("ID 探活失败 0x14=0x%02X (全零则可能死态)" % rid[4])
-
-        if not init_and_arm():
-            log("init_and_arm 失败：0x30 未置 0xBB，锁屏解锁不可用")
-            print("INIT_FAIL"); os.close(fd); sys.exit(3)
-
-        log("init+ARM done, waiting finger (3s timeout)")
-        if not wait_finger(3):
-            log("TIMEOUT no finger")
-            print("TIMEOUT"); os.close(fd); sys.exit(2)
-        probe = capture_once()
-        os.close(fd)
-        log("captured, computing NCC")
-
-        score = register_match(tpl, probe)
-        ok = score >= threshold
-        log("NCC=%.4f match=%s" % (score, "YES" if ok else "NO"))
-        print(f"NCC={score:.4f}  threshold={threshold}  match={'YES' if ok else 'NO'}")
-        sys.exit(0 if ok else 1)
+        _main(threshold)
+    except SystemExit:
+        raise
+    except Exception:
+        # 未捕获异常必须落日志（2026-10-07 教训：gpiochip PermissionError
+        # 连崩 284 次，日志静默无痕，排障只能靠 journal 反推）
+        import traceback
+        log("UNCAUGHT: " + traceback.format_exc().replace("\n", " | "))
+        raise
     finally:
         release_lock()
+
+
+def _main(threshold):
+    if not os.path.exists(TPL):
+        log("NO_TEMPLATE")
+        print("NO_TEMPLATE"); sys.exit(2)
+    tpl, tw, th = read_pgm_pixels(TPL)
+    assert tw == W and th == H
+
+    log("start threshold=%.2f" % threshold)
+    sys.stdout.write("ready..."); sys.stdout.flush()
+
+    setup_spi()
+
+    # (可选) 读 ID/FW 探活确认固件在跑
+    rid = rd10ef(0x14)
+    if rid[4] != 0x58:
+        log("ID 探活失败 0x14=0x%02X (全零则可能死态)" % rid[4])
+
+    if not init_and_arm():
+        log("init_and_arm 失败：0x30 未置 0xBB，锁屏解锁不可用")
+        print("INIT_FAIL"); os.close(fd); sys.exit(3)
+
+    log("init+ARM done, waiting finger (3s timeout)")
+    if not wait_finger(3):
+        log("TIMEOUT no finger")
+        print("TIMEOUT"); os.close(fd); sys.exit(2)
+    probe = capture_once()
+    os.close(fd)
+    log("captured, computing NCC")
+
+    score = register_match(tpl, probe)
+    ok = score >= threshold
+    log("NCC=%.4f match=%s" % (score, "YES" if ok else "NO"))
+    print(f"NCC={score:.4f}  threshold={threshold}  match={'YES' if ok else 'NO'}")
+    sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":
     main()

@@ -1,2 +1,15 @@
-# libfprint-fte3600 is a git submodule (added below)/
+# 指纹图像与抓包产物：绝不入库（生物特征数据）
+# 诊断脚本会在本目录生成 capture-*.pgm / capture-*.bin / capture-raw.bin 等
+*.pgm
+*.bin
+*.raw
+*.npy
+capture-*
+capture_*
+template*
+产物-*
+# 临时与构建产物
+__pycache__/
+*.pyc
+# 本地研究文档（不入公开仓库）
 feat/
