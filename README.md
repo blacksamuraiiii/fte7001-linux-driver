@@ -2,7 +2,9 @@
 
 FocalTech **FT9338**（ACPI `_HID`: **FTE7001**）的 Linux 指纹传感器驱动，面向 One Mix 3 等 Cherry Trail / Braswell 平板。
 
-**版本 v1.1 —— S5 关机后无需 Windows 交棒，Linux 独立完成芯片初始化。**
+仓库地址：<https://github.com/blacksamuraiiii/fte7001-linux-driver>
+
+**版本 v2.0 —— 形态 B：FpDevice + 自研关键点匹配器，fprintd 全链路（enroll/verify/锁屏）实测通过。**
 
 88×88 像素 match-on-host 传感器（非 match-on-chip），508 DPI，有效面积约 4.4×4.4 mm。SPI 通信（Intel LPSS，Mode 0，1 MHz），GPIO85 复位（nRST），GPIO86 中断在 Linux 下不触发（驱动用轮询兜底）。
 
@@ -17,8 +19,9 @@ FocalTech **FT9338**（ACPI `_HID`: **FTE7001**）的 Linux 指纹传感器驱�
 git clone --recurse-submodules https://github.com/blacksamuraiiii/fte7001-linux-driver
 cd fte7001-linux-driver/libfprint-fte3600
 
-# 2) 复制驱动文件（含冷启动状态机与固件 blob）
-cp ../driver/fte7001.{c,h} ../driver/ft9338-firmware.inc libfprint/drivers/
+# 2) 复制驱动文件（含冷启动状态机、匹配器与固件 blob）
+cp ../driver/fte7001.{c,h} ../driver/fte7001-matcher.{c,h} \
+   ../driver/ft9338-firmware.inc libfprint/drivers/
 
 # 3) 应用构建集成 patch（登记 fte7001 + gpiod 依赖）
 git apply ../driver/libfprint-integration.patch
@@ -32,6 +35,12 @@ ninja -C build
 sudo LD_LIBRARY_PATH=build/libfprint build/examples/img-capture
 ```
 
+```bash
+# 6) matcher 离线回归测试（合成夹具 ~2s，不依赖 libfprint 本体）
+cc -O2 -I tests -I driver tests/matcher-test.c driver/fte7001-matcher.c -lm \
+  -o /tmp/matcher-test && /tmp/matcher-test
+```
+
 **依赖**: `glib2-devel`, `gobject-introspection`, `meson`, `ninja`, `libgpiod >= 2.0`
 
 ### 构建集成
@@ -41,7 +50,7 @@ sudo LD_LIBRARY_PATH=build/libfprint build/examples/img-capture
 携带上游尚未合入的 SPI 传输层与 gpiod 辅助设施）：
 
 ```bash
-git clone --recurse-submodules <本仓库>
+git clone --recurse-submodules https://github.com/blacksamuraiiii/fte7001-linux-driver
 # 或已克隆后补拉:
 git submodule update --init
 ```
@@ -59,18 +68,18 @@ git submodule update --init
 ├── driver/
 │   ├── fte7001.c                     # libfprint 驱动（含冷启动状态机）
 │   ├── fte7001.h                     # 驱动头文件
+│   ├── fte7001-matcher.c             # 关键点匹配器（DoG+RANSAC，C 移植）
+│   ├── fte7001-matcher.h             # 匹配器头文件
 │   ├── ft9338-firmware.inc           # FT9338 冷启动固件 blob（14136 B）
 │   └── libfprint-integration.patch   # 构建系统集成（meson 登记 + gpiod）
 ├── tools/
 │   ├── fp-unlock.py                  # 自研 PAM 解锁脚本（含 S5 冷启动自愈）
 │   ├── ft9338-coldboot.py            # 冷启动全序列独立复刻（验证通过版）
-│   ├── ft9338-c2-test.py             # C2 认型号变体实验
-│   ├── ft9338-acut-probe.py          # A-CUT boot 三探针（严格只读）
-│   ├── ft9338-ef-latch-check.py      # 0xEF 一次性 latch 复现
-│   ├── ft9338-capture-diag.py        # 完整采图诊断（0x30 门闸 + 纯 5B 轮询）
-│   ├── ft9338-rearm-test.py          # ReturnAutoPower 重挂验证
-│   ├── ft9338-match-test.py          # 多帧采集 + 匹配验证
-│   └── ft9338-baseline.py            # 无手指基线
+│   ├── ft9338-calib-capture.py       # 标定采样（全屏提示窗 + 质量闸门）
+│   └── kp-matcher-prototype.py      # 匹配器 Python 原型（参数定稿依据）
+├── tests/
+│   ├── matcher-test.c                # matcher 离线回归（合成夹具，零依赖）
+│   └── matcher-fixture.h             # 合成纹理夹具（无真实指纹数据）
 └── LICENSE
 ```
 
@@ -139,13 +148,51 @@ ARM:         11EE 1F 01 → 11EE 1E 01（2ms 间隔, 10ms settle）
 
 | 链路 | 组成 | S5 冷启动后 |
 |---|---|---|
-| **fprintd 链路**（enroll/verify/GNOME 集成） | libfprint 驱动（`driver/`） | ✅ 驱动 `img_open()` 自动冷启动 |
-| **锁屏解锁链路**（Omarchy 锁屏） | PAM `omarchy-lock-fingerprint` → `tools/fp-unlock.py` → raw SPI | ✅ 握手失败时自动走 `cold_boot_sequence()` |
+| **fprintd 链路**（enroll/verify/锁屏/GNOME 集成） | libfprint 驱动（`driver/`，形态 B） | ✅ 驱动 open 自动冷启动（A-CUT→固件下载→工作态） |
+| **自研备用链路** | `tools/fp-unlock.py`（raw SPI + NCC 匹配） | ✅ 握手失败时自动走 `cold_boot_sequence()` |
 
-两条链路**独立运行、互不依赖**（解锁不走 fprintd）。`fp-unlock.py` 冷启动自愈需要
-`/usr/local/libexec/ft9338-firmware.bin`（与本仓库 `driver/ft9338-firmware.inc` 同源，14136 B）。
+v2.0 起锁屏走 pam_fprintd（官方链）；`fp-unlock.py` 保留为独立备胎（不依赖 fprintd，
+降级/排障用）。`fp-unlock.py` 冷启动自愈需要 `/usr/local/libexec/ft9338-firmware.bin`
+（与本仓库 `driver/ft9338-firmware.inc` 同源，14136 B）。
 
 首次登录界面（SDDM）目前仍用密码（未接 pam_fprintd）。
+
+### 匹配器（形态 B 核心）
+
+细节点太少（88×88 单帧约 1 个，低于 NBIS bozorth3 硬下限 10），FpImageDevice +
+NBIS 路线数学上不可行，v2.0 转普通 **FpDevice + 自研关键点匹配器**（学 FT9201/fte3600
+同门）：
+
+- 关键点：DoG 金字塔 σ=(2.0, 2.8, 4.0, 5.7)（脊距 8px 实测定标）
+- 描述子：16×16 patch，4×4 cells × 8 方向 = 128 维，主方向对齐，L2 归一
+- 匹配：Lowe ratio 0.9 + 相似变换 RANSAC（旋转+平移+±30% 尺度）
+- 打分：内点数 / min(特征数) × 100，阈值 7.0（真指 min 13.1 / 异指 max 3.1，4.2 倍分界）
+- 质量闸门：纹理覆盖 ≥70% + 纹理均值 ≥15，废片拒收重按
+- 模板：每指 9 帧原图（≈70 KB），wire 格式版本化（magic "FT93"），存 FpPrint fpi-data
+
+**模板敏感性与存放位置（须知）**：模板存的是 **9 帧原始指纹图**（不是不可逆的特征
+模板），比 NBIS 等标准模板更敏感。它由 fprintd 以 root 权限保存在
+`/var/lib/fprint/`，本驱动不落任何额外副本、不进本仓库（.gitignore 双保险）。
+
+**第二根手指的现状**：v2.0 未实现 identify，锁屏只对单一 enrolled print 做 verify；
+且 fprintd 对非空指纹库默认拦截重复 enroll。需要换手指/重录时先
+`fprintd-delete`（或 GNOME 设置里先删除旧指纹）再 enroll，这是设计内行为不是 bug。
+
+**阈值 7.0 的来历**：由 2026-10-07 的标定数据实测定稿——真指 10/10（min 13.1），
+异指 0/4 误识（max 3.1），4.2 倍分界。模板帧数分布（同指 probe 10 张 / 异指 4 张）：
+
+| 模板帧数 | 同指 min | 同指 med | 异指 max | 分界余量 |
+|---|---|---|---|---|
+| 5  | 3.8  | 33.3 | 3.1 | +0.8  |
+| 7  | 13.1 | 36.0 | 3.1 | +10.1 |
+| 9  | 13.1 | 38.1 | 3.1 | +10.1 |
+
+9 帧为留一验证定稿值；改阈值前先复看这组分布（本地原始数据
+`feat/模板帧数分布曲线-20261007.txt`，方法可从 `tests/matcher-test.c` 的合成
+夹具复现），别凭感觉调。
+
+C 实现与 Python 原型同图同分（95/95 对 diff=0.00，含 MT19937 随机流逐位复现），
+标定与帧数分布数据见 `tools/kp-matcher-prototype.py` 及其使用记录。
 
 ---
 
@@ -183,7 +230,25 @@ ARM:         11EE 1F 01 → 11EE 1E 01（2ms 间隔, 10ms settle）
 
 ## 版本更新
 
-### v1.1 (2026-10-07)
+### v2.0
+
+- **形态 B 重写**：`FpImageDevice` → 普通 `FpDevice`（enroll 9 阶 / verify / cancel），
+  identify 不实现（单用户锁屏 verify 即可）。NBIS 依赖随形态 A 一并移除
+- **自研关键点匹配器**（`fte7001-matcher.c`）：DoG + 128 维描述子 + 相似变换
+  RANSAC，参数由离线原型实测定稿；质量闸门拒收废片
+- **fprintd 全链路实测**：enroll 9/9、verify 10/10、S5 冷启直达 verify（A-CUT→
+  固件下载→匹配 17.2 分）、睡眠唤醒 verify、守护进程 20+ 轮 Claim/Release 零崩溃
+- **fprintd 竞态修复**：spidev 路径缓存（Claim 循环二次 open 拿 NULL 会触发
+  fprintd 自身 double-free）；verify 取消路径补 report 语义
+- **锁屏切换 pam_fprintd**（盖盖闸门 + sufficient），`fp-unlock.py` 转为备用链路
+- 采图管线逐字节保留（纯 5B 轮询/看门狗软唤醒/双帧确认/0x30 门闸），
+  新增 WAIT_OFF 真抬起检测（连续 2 帧 + 2s 兜底）与每阶质量重采上限
+- verify 日志记录每帧分数与最高两帧（journal，观察期阈值调优与
+  "top-2 代替 max"实验可离线复算，无需重录指纹）
+- 新增 `tests/`：matcher 离线回归（合成纹理夹具，~2s 跑完，不含真实指纹数据）
+- 工具精简：删除 7 个冷启动研究期考古探针（结论已沉淀文档）
+
+### v1.1
 
 - **修复锁屏冷启动权限崩溃**：v1.0 冷序列的 GPIO85 复位在 PAM 普通用户上下文 `PermissionError` 静默连崩（S5 后首锁屏解锁必失败）。修复：udev 规则 gpiochip0 0666（部署机）+ 未捕获异常先落日志再抛 + 修复后的真实锁场景实测通过
 - **手指检测双修复**：① wait_finger 双帧确认消假阳性（挂起唤醒毛刺曾致连续误采空图）；② 回滚误加的 16B 保活帧——实测等待态 16B 长帧读 0x1D 会打挂 MCU，回滚后 3/3 连测通过、NCC 恢复 0.15–0.31
@@ -193,15 +258,15 @@ ARM:         11EE 1F 01 → 11EE 1E 01（2ms 间隔, 10ms settle）
 - **固件 blob 许可豁免**：FocalTech 专有声明（LGPL 不覆盖）+ DMCA 先例警示
 - **.gitignore 补全**：指纹图像/抓包产物排除（*.pgm / *.bin / capture-* 等），生物特征数据永不入库
 
-### v1.0 (2026-10-06)
+### v1.0
 - **冷启动状态机进驱动**：`img_open()` 自动完成 A-CUT 判定 → FE 检查 → 进下载模式 → 05FA 固件下发 → 04FB 校验 → **芯片双复位重启**（反汇编 0x001665 证实的缺失拼图）→ config init；14136 B 固件 blob 编入驱动
 - **fp-unlock.py 冷启动自愈**：握手失败（非 A5 5A）时自动走完整冷序列，S5 后锁屏指纹无需 Windows 交棒
 - C2 认型号判据修正（`rx[3]==0x55`）；libfprint-fte3600 转正 submodule；工具统一 `ft9338-*` 前缀
 
-### v0.2 (2026-10-05)
+### v0.2
 - 暖路径自愈脚本 + 开机服务（后被 v1.0 取代）
 
-### v0.1 (2026-10-03)
+### v0.1
 - 初始发布：完整采图链路 + 自研 PAM 解锁方案
 
 ---

@@ -51,6 +51,10 @@
 #define FT9338_IMAGE_PPMM      20.0  /* 508 DPI */
 
 #define FT9338_IRQ_FALLBACK_POLL_MS  50
+/* Form B (2026-10-07): 9 frames per finger — leave-one-out verified
+ * (true-finger min 13.1 vs threshold 7.0); 7 works, 5 does not
+ * (margin +0.8).  See feat/模板帧数分布曲线-20261007.txt. */
+#define FT9338_ENROLL_STAGES 9
 /* --- Timing constants (ms) --- */
 #define FT9338_RESET_PULSE_MS     20      /* warm/reset fallback */
 #define FT9338_RESET_DELAY_MS      6

@@ -18,13 +18,14 @@
 
 #include "fte7001.h"
 #include "drivers_api.h"
-#include "fpi-image-device.h"
+#include "fte7001-matcher.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <gpiod.h>
 #include <gudev/gudev.h>
 #include <linux/spi/spidev.h>
+#include <math.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -68,7 +69,7 @@ fpi_fte7001_lookup_gpio_profile (const gchar *sys_vendor,
 /* ----- Device struct ----- */
 struct _FpiDeviceFte7001
 {
-  FpImageDevice      parent;
+  FpDevice           parent;
 
   /* SPI */
   gint              spi_fd;
@@ -92,14 +93,25 @@ struct _FpiDeviceFte7001
   guint             warm_retries;      /* warm-path MCU idle re-reads before falling to cold */
   guint16           chip_id;
   guint8           *fw_write_buf;      /* 05 FA transfer buffer (header+blob+tail) */
-  guint8           *fw_readback_buf;   /* 04 FB RX buffer */
+  guint8           *fw_readback_buf;  /* 04 FB RX buffer */
 
-  /* Image */
-  FpImage          *captured_image;
+  /* Form B (FpDevice) action state */
+  guint             gate_rearm_count;      /* 0x30 gate re-ARM budget per stage */
+  guint             enroll_stage;           /* 0..FT9338_ENROLL_STAGES-1 */
+  guint             quality_retries;        /* per-stage quality-gate re-captures */
+  gboolean          image_handed_over;      /* frame consumed; cleanup errors only logged */
+  gint64            wait_off_start;         /* WAIT_OFF round start (2 s cap) */
+  guint             wait_off_lift_count;    /* consecutive no-finger frames */
+  Fte7001Frame     *enroll_frames[FT9338_ENROLL_STAGES];
+  FpPrint          *enroll_print;           /* template container from fpi_device_get_enroll_data */
+  Fte7001Frame      verify_probe;            /* single probe frame (form B) */
+  gboolean          verify_probe_valid;
+  gchar            *spidev_cached;           /* re-open fallback (fprintd Claim cycles) */
+  GCancellable     *worker_cancellable;     /* matcher GTask */
 };
 
-G_DECLARE_FINAL_TYPE (FpiDeviceFte7001, fpi_device_fte7001, FPI, DEVICE_FTE7001, FpImageDevice)
-G_DEFINE_TYPE (FpiDeviceFte7001, fpi_device_fte7001, FP_TYPE_IMAGE_DEVICE)
+G_DECLARE_FINAL_TYPE (FpiDeviceFte7001, fpi_device_fte7001, FPI, DEVICE_FTE7001, FpDevice)
+G_DEFINE_TYPE (FpiDeviceFte7001, fpi_device_fte7001, FP_TYPE_DEVICE)
 
 /* ----- helpers ----- */
 static guint8
@@ -124,16 +136,6 @@ fte7001_mcu_is_idle (FpiDeviceFte7001 *self)
   return self->small_rx_valid &&
          self->small_rx[FT9338_REG_READ_HEADER_SIZE] == 0xa5 &&
          self->small_rx[FT9338_REG_READ_HEADER_SIZE + 1] == 0x5a;
-}
-
-static void
-fte7001_clear_captured_image (FpiDeviceFte7001 *self)
-{
-  if (self->captured_image)
-    {
-      g_clear_object (&self->captured_image);
-      self->captured_image = NULL;
-    }
 }
 
 /* ----- SPI transfer helpers ----- */
@@ -563,9 +565,10 @@ enum fte7001_init_state {
   FTE7001_INIT_COLD_FW_WRITE,
   FTE7001_INIT_COLD_FW_READBACK,
   /* Verify the 04 FB payload byte-for-byte against the blob.  The frame
-   * carries a 6-byte receipt header, so the blob start offset varies:
-   * locate it by matching the first 64 blob bytes within the first 16 RX
-   * bytes, then memcmp the whole blob (same approach as fp-unlock.py). */
+   * carries a receipt header, so the blob start offset varies: locate it
+   * by matching the first 64 blob bytes anywhere in the readback buffer
+   * (off ≤ READBACK_RX - BLOB_SIZE), then memcmp the whole blob (same
+   * approach as fp-unlock.py). */
   FTE7001_INIT_COLD_FW_READBACK_CHECK,
   /* Cold path: chip restart after firmware download.
    * Windows DownLoadFirewareInternal 0x001665-0x0016AB (chip_type==1):
@@ -619,16 +622,23 @@ enum fte7001_init_state {
 };
 
 static void
-fte7001_img_open (FpImageDevice *dev)
+fte7001_open (FpDevice *dev)
 {
   FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (dev);
   g_autofree gchar *spidev_path = NULL;
   GError *error = NULL;
 
-  spidev_path = fpi_device_get_udev_data (FP_DEVICE (dev), FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
+  /* Cache the spidev path on first successful open: the framework may
+   * hand us a NULL udev path on re-open inside the same daemon lifetime
+   * (Claim→Release→Claim cycles, 2026-10-07 fprintd evidence: second
+   * open after close reported NOT_SUPPORTED and crashed fprintd's
+   * Claim error path with a double free). */
+  spidev_path = g_strdup (fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV));
+  if (!spidev_path && self->spidev_cached)
+    spidev_path = g_strdup (self->spidev_cached);
   if (!spidev_path || !fte7001_probe_acpi (self, spidev_path))
     {
-      fpi_image_device_open_complete (dev,
+      fpi_device_open_complete (dev,
         fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
                                    "FTE7001: unknown or unsupported platform"));
       return;
@@ -636,7 +646,7 @@ fte7001_img_open (FpImageDevice *dev)
 
   if (!fte7001_take_gpio (self, &error))
     {
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
@@ -644,9 +654,9 @@ fte7001_img_open (FpImageDevice *dev)
   if (self->spi_fd < 0)
     {
       /* Open failed before the SSM exists: the framework will not call
-       * img_close, so release the GPIO claimed above ourselves. */
+       * close, so release the GPIO claimed above ourselves. */
       fte7001_release_gpio (self);
-      fpi_image_device_open_complete (dev,
+      fpi_device_open_complete (dev,
         g_error_new (G_IO_ERROR, g_io_error_from_errno (errno),
                      "FTE7001: cannot open %s: %s", spidev_path,
                      g_strerror (errno)));
@@ -657,19 +667,22 @@ fte7001_img_open (FpImageDevice *dev)
       close (self->spi_fd);
       self->spi_fd = -1;
       fte7001_release_gpio (self);
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
+  /* Remember the working path for re-opens (see comment above). */
+  g_free (self->spidev_cached);
+  self->spidev_cached = g_strdup (spidev_path);
+
   /* Start init SSM: universal first probe (90 00 00 → A-CUT detect),
-   * then branch warm/cold.  No 60 s window — cold boot detection is
-   * sub-millisecond, per the Windows reference capture (first frame → work state 4.14 s). */
+   * then branch warm/cold. */
   self->cold_path = FALSE;
   self->fe_round = 0;
   self->warm_retries = 0;
   self->chip_id = 0;
   {
-    FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (dev), fte7001_init_handler, FTE7001_INIT_NSTATES);
+    FpiSsm *ssm = fpi_ssm_new (dev, fte7001_init_handler, FTE7001_INIT_NSTATES);
     self->task_ssm = ssm;
     fpi_ssm_start (ssm, fte7001_init_complete);
     return;
@@ -677,7 +690,7 @@ fte7001_img_open (FpImageDevice *dev)
 }
 
 static void
-fte7001_img_close (FpImageDevice *dev)
+fte7001_close (FpDevice *dev)
 {
   FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (dev);
 
@@ -687,10 +700,10 @@ fte7001_img_close (FpImageDevice *dev)
       close (self->spi_fd);
       self->spi_fd = -1;
     }
-  fpi_image_device_close_complete (dev, NULL);
+  fpi_device_close_complete (dev, NULL);
 }
 
-/* ----- State machines ----- */
+/* ----- Action SSM (form B: shared capture pipeline for enroll/verify) ----- */
 static void fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev);
 static void fte7001_capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error);
 
@@ -711,13 +724,27 @@ enum fte7001_capture_state {
   FTE7001_CAPTURE_CONFIRM_FINGER_CHECK,
   FTE7001_CAPTURE_GATE_READ_30,
   FTE7001_CAPTURE_GATE_CHECK_30,
+  /* Pre-capture 16B frame — the ONE legal 16B read position ("采图前一瞬",
+   * production capture_once: 10 EF 1D 5B, then 16B, then 04FB).
+   * Missing it corrupts the image RAM readout (form-B rewrite regression,
+   * found by diffing tools/ft9338-calib-capture.py capture_once 2026-10-07). */
+  FTE7001_CAPTURE_PRE_READ_5B,
+  FTE7001_CAPTURE_PRE_READ_16B,
   FTE7001_CAPTURE_READ_IMAGE,
-  FTE7001_CAPTURE_PROCESS_IMAGE,
+  FTE7001_CAPTURE_PROCESS_FRAME,
   FTE7001_CAPTURE_CLEANUP_READ_20,
   FTE7001_CAPTURE_CLEANUP_WRITE_54,
   FTE7001_CAPTURE_CLEANUP_READ_20B,
+  /* Finger-off must be a real lift (form B design §三.4 / plan §三):
+   * 5B poll until 2 consecutive frames with neither finger criterion,
+   * 2 s cap, then report off. */
+  FTE7001_CAPTURE_WAIT_OFF_POLL,
+  FTE7001_CAPTURE_WAIT_OFF_CHECK,
+  /* Quality-gate rejection: finger still down, wait for real lift then
+   * re-capture the same stage. */
+  FTE7001_CAPTURE_WAIT_OFF2_POLL,
+  FTE7001_CAPTURE_WAIT_OFF2_CHECK,
   FTE7001_CAPTURE_REPORT_OFF,
-  FTE7001_CAPTURE_CLEANUP_LOOP,
   FTE7001_CAPTURE_DONE,
   FTE7001_CAPTURE_NSTATES,
 };
@@ -739,6 +766,29 @@ fte7001_fail_if_cancelled (FpiSsm *ssm, FpDevice *dev)
   fpi_ssm_mark_failed (ssm, error);
   return TRUE;
 }
+
+/* Finger-present criteria (Linux-verified 2026-10-07, dual-criterion OR). */
+static gboolean
+fte7001_finger_present (FpiDeviceFte7001 *self)
+{
+  return self->small_rx[4] == 0x01 || self->small_rx[4] == 0xa0 ||
+         (self->small_rx[2] == 0x11 && self->small_rx[3] == 0x11);
+}
+
+/* WAIT_OFF 子循环共享：轮询 5B 直到真抬起（连续 2 帧双判据皆否）。
+ * 参数 wait_start_us 为该轮等待的起点（2 s 兜底用）。 */
+static void
+fte7001_wait_off_submit (FpiSsm *ssm, gint64 wait_start_us)
+{
+  /* 2 s cap is evaluated by the caller (CHECK state) — submitting here
+   * keeps the loop shape uniform (POLL → CHECK → POLL). */
+  (void) wait_start_us;
+  fte7001_submit_reg_read (ssm, FT9338_REG_FINGER_STATUS, 1, TRUE);
+}
+
+static void fte7001_clear_enroll_frames (FpiDeviceFte7001 *self);
+static void fte7001_start_verify_match (FpiDeviceFte7001 *self);
+static void fte7001_start_capture_ssm (FpiDeviceFte7001 *self, FpDevice *dev);
 
 /* ----- Init SSM ----- */
 static void
@@ -1009,7 +1059,7 @@ fte7001_init_handler (FpiSsm *ssm, FpDevice *dev)
           memset (self->fw_readback_buf, 0, FT9338_FW_READBACK_RX);
           fpi_ssm_mark_failed (ssm,
             fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-              "FT9338 firmware readback mismatch (blob not found in first 16 B)"));
+              "FT9338 firmware readback mismatch (firmware blob not found in readback buffer)"));
           return;
         }
       memset (self->fw_readback_buf, 0, FT9338_FW_READBACK_RX);
@@ -1179,18 +1229,18 @@ fte7001_init_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   self->task_ssm = NULL;
   if (error)
     {
-      /* Init failed: the framework will not call img_close after a
-       * failed open, so undo img_open's claims here (fd + GPIO). */
+      /* Init failed: the framework will not call close after a
+       * failed open, so undo open's claims here (fd + GPIO). */
       if (self->spi_fd >= 0)
         {
           close (self->spi_fd);
           self->spi_fd = -1;
         }
       fte7001_release_gpio (self);
-      fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), error);
+      fpi_device_open_complete (dev, error);
       return;
     }
-  fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), NULL);
+  fpi_device_open_complete (dev, NULL);
 }
 
 /* ----- Capture SSM ----- */
@@ -1204,6 +1254,8 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
     {
     case FTE7001_CAPTURE_ARM_1F:
       if (fte7001_fail_if_cancelled (ssm, dev)) return;
+      self->gate_rearm_count = 0;   /* per-stage budget (design §三) */
+      self->image_handed_over = FALSE;   /* per-stage handover flag */
       fte7001_submit_reg_write (ssm, FT9338_REG_CAPTURE_ENABLE, 0x01, TRUE);
       return;
     case FTE7001_CAPTURE_ARM_1F_DELAY:
@@ -1234,19 +1286,8 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
     {
       static const guint8 cmd70[1] = { 0x70 };
 
-      /* Finger presence criteria (Linux-verified 2026-10-07):
-       *   - RX[4] == 0x01/0xA0: image-RAM-ready.  Windows ISR criterion —
-       *     only reliable in a narrow window right after ARM; disappears
-       *     once the chip settles (production unlock + instrumented runs
-       *     both show it never firing while 11 11 is solid).
-       *   - RX[2:3] == 11 11: finger physically present.  The one signal
-       *     that reliably appears in EVERY Linux capture session.
-       * Either means "go capture now" — confirmed by a second frame below
-       * (ARM-adjacent residual frames can fake the signal). */
-      finger_status =
-        self->small_rx[4] == 0x01 || self->small_rx[4] == 0xa0 ||
-        (self->small_rx[2] == 0x11 && self->small_rx[3] == 0x11);
-      g_debug ("FT9338 0x1D 5B: %02x %02x %02x %02x %02x  ready=%d",
+      finger_status = fte7001_finger_present (self);
+      fp_dbg ("FT9338 0x1D 5B: %02x %02x %02x %02x %02x  ready=%d",
                self->small_rx[0], self->small_rx[1], self->small_rx[2],
                self->small_rx[3], self->small_rx[4], finger_status);
       if (finger_status)
@@ -1271,7 +1312,7 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
       if (self->false_finger_count >= FT9338_SUSPEND_WAKE_FRAMES)
         {
           self->false_finger_count = 0;
-          fp_dbg ("FT9338 wait loop: %u all-zero frames → 0x70 soft wake",
+          fp_dbg ("FT9338 wait loop: %u all-zero frames → 0x70 soft wake + re-ARM",
                   FT9338_SUSPEND_WAKE_FRAMES);
           fte7001_submit_write_only (ssm, cmd70, 1);
           return;
@@ -1283,10 +1324,11 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
     case FTE7001_CAPTURE_SOFT_WAKE_1:
     {
       /* Second 0x70 of the wake pair (production idiom is 0x70 ×2 with
-       * a 6 ms gap).  On completion the SSM advances to CONFIRM_FINGER_1,
-       * whose 60 ms delay doubles as the post-wake settle time; the
-       * confirmation read then either sees a finger or falls back to
-       * the 5B poll loop. */
+       * a 6 ms gap).  After the wake the chip lost its ARM state —
+       * returning to POLL_5B leaves a dead wait loop (2026-10-07 evening
+       * run: 20 s of idle frames, 11 11 never came after suspend).
+       * Re-ARM instead: the ARM sequence reopens the finger window
+       * (matches calib/rearm_after_capture practice). */
       static const guint8 cmd70[1] = { 0x70 };
       fte7001_submit_write_only (ssm, cmd70, 1);
       return;
@@ -1298,15 +1340,16 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
       fte7001_submit_reg_read (ssm, FT9338_REG_FINGER_STATUS, 1, TRUE);
       return;
     case FTE7001_CAPTURE_CONFIRM_FINGER_CHECK:
-      if (self->small_rx[4] == 0x01 || self->small_rx[4] == 0xa0 ||
-          (self->small_rx[2] == 0x11 && self->small_rx[3] == 0x11))
+      if (fte7001_finger_present (self))
         {
-          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
+          fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
           fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_GATE_READ_30);
           return;
         }
-      /* Glitch — back to the poll loop. */
-      fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_POLL_5B);
+      /* Glitch / post-wake no-finger — re-ARM rather than polling: after
+       * the suspend+wake cycle the ARM window is gone and 0x1D stays
+       * idle forever (2026-10-07 evening run evidence).  ARM reopens it. */
+      fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_ARM_1F);
       return;
 
     case FTE7001_CAPTURE_GATE_READ_30:
@@ -1316,45 +1359,84 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
     case FTE7001_CAPTURE_GATE_CHECK_30:
       if (fte7001_read_result_byte (self) != 0xbb)
         {
-          /* Marker lost while the finger was down (chip dropped out of
-           * armed state during the poll).  Re-ARM once instead of failing
-           * the whole action — the next poll cycle re-detects the finger. */
-          fp_dbg ("FT9338 config marker lost before capture (%02x) → re-ARM",
-                  fte7001_read_result_byte (self));
+          /* Marker lost while the finger was down.  Re-ARM with a budget
+           * (plan §二.2): >3 re-ARMs in one stage means the marker is
+           * really gone — fail the action instead of spinning forever. */
+          if (++self->gate_rearm_count > 3)
+            {
+              fpi_ssm_mark_failed (ssm,
+                fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                  "FT9338 config marker lost repeatedly before capture"));
+              return;
+            }
+          fp_dbg ("FT9338 config marker lost before capture (%02x) → re-ARM %u/3",
+                  fte7001_read_result_byte (self), self->gate_rearm_count);
           fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_ARM_1F);
           return;
         }
       fpi_ssm_next_state (ssm);
       return;
 
+    case FTE7001_CAPTURE_PRE_READ_5B:
+      /* capture_once frame 1: 10 EF 1D 00 00 00 (5B data in 6B frame) */
+      fte7001_submit_reg_read (ssm, FT9338_REG_FINGER_STATUS, 2, TRUE);
+      return;
+    case FTE7001_CAPTURE_PRE_READ_16B:
+      /* capture_once frame 2: 10 EF 1D 00 00 00 00 00 00 00 00 00 00 00 00 00 00 */
+      fte7001_submit_reg_read (ssm, FT9338_REG_FINGER_STATUS, 12, TRUE);
+      return;
     case FTE7001_CAPTURE_READ_IMAGE:
       fte7001_submit_capture (ssm);
       return;
-    case FTE7001_CAPTURE_PROCESS_IMAGE:
-      fte7001_clear_captured_image (self);
-      self->captured_image =
-        fp_image_new (FT9338_IMAGE_WIDTH, FT9338_IMAGE_HEIGHT);
-      self->captured_image->ppmm = FT9338_IMAGE_PPMM;
-      self->captured_image->flags |= FPI_IMAGE_PARTIAL;
+    case FTE7001_CAPTURE_PROCESS_FRAME:
+    {
+      Fte7001Frame *frame = g_new (Fte7001Frame, 1);
+      float cov, mtc;
+      gboolean ok;
 
+      /* Hand-over format: invert per byte, FPI_IMAGE_PARTIAL equivalent. */
       for (gsize i = 0; i < FT9338_IMAGE_SIZE; i++)
-        self->captured_image->data[i] =
-          (guint8) ~self->capture_rx[FT9338_CAPTURE_DATA_OFFSET + i];
-
+        frame->pixels[i] = (guint8) ~self->capture_rx[FT9338_CAPTURE_DATA_OFFSET + i];
       /* Secure-clear the raw SPI buffer */
       memset (self->capture_rx, 0, FT9338_CAPTURE_FRAME_SIZE);
-      /* Hand the image over FIRST (framework: CAPTURE→AWAIT_FINGER_OFF,
-       * minutiae starts async).  While the framework is busy we run the
-       * ReturnAutoPower cleanup so the sensor is re-armed BEFORE we
-       * report finger-off.  Only then report off: the framework may
-       * immediately deactivate (identify completes → auto-deactivate),
-       * and at that point every SPI transfer has already finished —
-       * no in-flight transfer gets cancelled mid-sequence, which is
-       * what corrupted the previous attempts (2026-10-07). */
-      fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev),
-                                       g_steal_pointer (&self->captured_image));
+
+      ok = fte7001_quality_check (frame, &cov, &mtc);
+      fp_dbg ("FT9338 frame quality: cov=%.2f mtc=%.1f gate=%s",
+              cov, mtc, ok ? "PASS" : "REJECT");
+
+      if (!ok)
+        {
+          g_free (frame);
+          if (self->quality_retries >= 3)
+            {
+              fpi_ssm_mark_failed (ssm,
+                fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+              return;
+            }
+          self->quality_retries++;
+          /* Finger probably still on the sensor — wait for a real lift,
+           * then re-capture the same stage. */
+          fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_WAIT_OFF2_POLL);
+          return;
+        }
+
+      self->quality_retries = 0;
+      self->image_handed_over = TRUE;
+      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
+        {
+          g_assert (self->enroll_stage < FT9338_ENROLL_STAGES);
+          self->enroll_frames[self->enroll_stage] = frame;
+          fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
+        }
+      else
+        {
+          memcpy (&self->verify_probe, frame, sizeof (*frame));
+          self->verify_probe_valid = TRUE;
+          g_free (frame);
+        }
       fpi_ssm_next_state (ssm);   /* → CLEANUP (ReturnAutoPower) */
       return;
+    }
 
     case FTE7001_CAPTURE_CLEANUP_READ_20:
       /* ReturnAutoPower: 10 EF 20 → 11 EE 54 01 → 10 EF 20 */
@@ -1366,30 +1448,100 @@ fte7001_capture_handler (FpiSsm *ssm, FpDevice *dev)
     case FTE7001_CAPTURE_CLEANUP_READ_20B:
       fte7001_submit_reg_read (ssm, FT9338_REG_MCU_STATUS, 2, TRUE);
       return;
-    case FTE7001_CAPTURE_REPORT_OFF:
-      /* Cleanup done and sensor re-armed — NOW tell the framework the
-       * finger is off.  It may deactivate us immediately (identify
-       * auto-deactivate); we are idle, so cancellation is harmless. */
-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
-      fpi_ssm_next_state (ssm);
+
+    case FTE7001_CAPTURE_WAIT_OFF_POLL:
+      if (fte7001_fail_if_cancelled (ssm, dev)) return;
+      /* Sentinel: wait_off_start == 0 means "round not started" — set it
+       * ONCE per round, otherwise the 2 s cap in wait_off_submit can
+       * never fire (each poll would reset the origin). */
+      if (self->wait_off_start == 0)
+        self->wait_off_start = g_get_monotonic_time ();
+      fte7001_wait_off_submit (ssm, self->wait_off_start);
       return;
-    case FTE7001_CAPTURE_CLEANUP_LOOP:
-      /* Branch on the current action (framework contract, fpi-image-device.c):
-       *   ENROLL  → keep polling for the next touch (the framework stays
-       *             active and waits for the next finger-on report).
-       *   IDENTIFY/VERIFY/CAPTURE → the framework deactivates as soon as
-       *             the finger-off report lands (maybe_complete_action →
-       *             identify_complete).  Restarting the poll here races
-       *             the cancellation and fails the whole session with
-       *             G_IO_ERROR_CANCELLED (2026-10-07) — so just complete
-       *             the SSM and let deactivate take over. */
-      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
+    case FTE7001_CAPTURE_WAIT_OFF_CHECK:
+      if (self->wait_off_start > 0 &&
+          g_get_monotonic_time () - self->wait_off_start > 2 * G_TIME_SPAN_SECOND)
         {
-          if (fte7001_fail_if_cancelled (ssm, dev)) return;
+          /* 2 s cap — treat as lifted (user will not hold forever). */
+          self->wait_off_lift_count = 0;
+          self->wait_off_start = 0;
+          fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_REPORT_OFF);
+          return;
+        }
+      if (fte7001_finger_present (self))
+        self->wait_off_lift_count = 0;
+      else if (self->small_rx_valid)
+        self->wait_off_lift_count++;
+      if (self->wait_off_lift_count >= 2)
+        {
+          self->wait_off_lift_count = 0;
+          self->wait_off_start = 0;
+          /* WAIT_OFF2_POLL sits between CHECK and REPORT_OFF in the enum:
+           * next_state would land in the quality-retry loop! */
+          fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_REPORT_OFF);
+          return;
+        }
+      fpi_ssm_jump_to_state_delayed (ssm, FTE7001_CAPTURE_WAIT_OFF_POLL,
+                                     FT9338_IRQ_FALLBACK_POLL_MS);
+      return;
+
+    case FTE7001_CAPTURE_WAIT_OFF2_POLL:
+      if (fte7001_fail_if_cancelled (ssm, dev)) return;
+      if (self->wait_off_start == 0)
+        self->wait_off_start = g_get_monotonic_time ();
+      fte7001_wait_off_submit (ssm, self->wait_off_start);
+      return;
+    case FTE7001_CAPTURE_WAIT_OFF2_CHECK:
+      if (self->wait_off_start > 0 &&
+          g_get_monotonic_time () - self->wait_off_start > 2 * G_TIME_SPAN_SECOND)
+        {
+          self->wait_off_lift_count = 0;
+          self->wait_off_start = 0;
           self->capture_deadline =
             g_get_monotonic_time () + (gint64) FT9338_FINGER_TIMEOUT_MS * 1000;
           fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_POLL_5B);
           return;
+        }
+      if (fte7001_finger_present (self))
+        self->wait_off_lift_count = 0;
+      else if (self->small_rx_valid)
+        self->wait_off_lift_count++;
+      if (self->wait_off_lift_count >= 2)
+        {
+          /* Real lift after a quality rejection — same stage, fresh
+           * finger press. */
+          self->wait_off_lift_count = 0;
+          self->wait_off_start = 0;
+          self->capture_deadline =
+            g_get_monotonic_time () + (gint64) FT9338_FINGER_TIMEOUT_MS * 1000;
+          fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_POLL_5B);
+          return;
+        }
+      fpi_ssm_jump_to_state_delayed (ssm, FTE7001_CAPTURE_WAIT_OFF2_POLL,
+                                     FT9338_IRQ_FALLBACK_POLL_MS);
+      return;
+
+    case FTE7001_CAPTURE_REPORT_OFF:
+      self->wait_off_start = 0;   /* leave the wait loop (timeout exit too) */
+      fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+      /* ENROLL → next stage or finish; VERIFY → SSM completes and the
+       * complete callback dispatches the matcher.  No per-action fork
+       * beyond this point (form B deletes CLEANUP_LOOP — the 2026-10-07
+       * crash layer). */
+      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
+        {
+          if (fte7001_fail_if_cancelled (ssm, dev)) return;
+          self->enroll_stage++;
+          if (self->enroll_stage < FT9338_ENROLL_STAGES)
+            {
+              self->capture_deadline =
+                g_get_monotonic_time () + (gint64) FT9338_FINGER_TIMEOUT_MS * 1000;
+              fpi_ssm_jump_to_state (ssm, FTE7001_CAPTURE_ARM_1F);
+              return;
+            }
+          /* All stages captured — SSM completes; template assembly and
+           * enroll_complete happen in the complete callback (single
+           * exit rule). */
         }
       fpi_ssm_next_state (ssm);   /* → DONE */
       return;
@@ -1408,68 +1560,463 @@ fte7001_capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (dev);
 
   self->task_ssm = NULL;
-  /* Images are handed over inside PROCESS_IMAGE while the SSM keeps
-   * polling, so reaching here means the SSM ended outside the happy
-   * loop: finger-wait timeout, cancellation (deactivate) or a hard
-   * error.  Map them the standard way (elan shape, 2026-10-07). */
-  if (self->captured_image)
+
+  /* Complete-callback is the ONLY exit for *_complete calls (design
+   * invariant).  Error mapping happens here, by kind. */
+  if (error && self->image_handed_over &&
+      !g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
     {
-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
-      fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev),
-                                       g_steal_pointer (&self->captured_image));
+      /* Frame already consumed; a cleanup failure must not kill the
+       * action (plan §二.3 form-B equivalent).  The captured frame is
+       * safe in enroll_frames[] / verify_probe — resume the action as
+       * if the capture loop had finished normally. */
+      fp_dbg ("FT9338 cleanup after frame handover failed (ignored): %s",
+              error->message);
+      g_error_free (error);
+      error = NULL;
+
+      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
+        {
+          self->enroll_stage++;
+          if (self->enroll_stage < FT9338_ENROLL_STAGES)
+            {
+              fte7001_start_capture_ssm (self, dev);
+              return;
+            }
+          /* fall through: all stages done — assemble template below */
+        }
+      else if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
+        {
+          if (self->verify_probe_valid)
+            {
+              fte7001_start_verify_match (self);
+              return;
+            }
+          /* no probe (handover flag set but SSM died before READ_IMAGE?
+           * cannot happen; guard anyway) */
+          fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+              "FT9338 verify lost probe after cleanup failure"));
+          fpi_device_verify_complete (dev, NULL);
+          return;
+        }
+      else
+        return;
+    }
+
+  /* (No switch: -Wswitch-enum with the full FpiDeviceAction list.) */
+  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
+    {
+      if (!error && self->enroll_stage >= FT9338_ENROLL_STAGES)
+        {
+          /* All stages captured — assemble the wire template into the
+           * FpPrint from fpi_device_get_enroll_data. */
+          GVariant *data;
+          gsize wire_len = 14 + (gsize) FT9338_ENROLL_STAGES * FT9338_IMAGE_SIZE;
+          guint8 *wire = g_malloc (wire_len);
+          guint i;
+
+          wire[0] = 'F'; wire[1] = 'T'; wire[2] = '9'; wire[3] = '3';
+          wire[4] = 1;    /* version */
+          wire[5] = FT9338_ENROLL_STAGES;
+          wire[6] = 0; wire[7] = FT9338_IMAGE_WIDTH;    /* big-endian */
+          wire[8] = 0; wire[9] = FT9338_IMAGE_HEIGHT;
+          wire[10] = (guint8) (((guint32) (FT9338_ENROLL_STAGES * FT9338_IMAGE_SIZE)) >> 24) & 0xff;
+          wire[11] = (guint8) (((guint32) (FT9338_ENROLL_STAGES * FT9338_IMAGE_SIZE)) >> 16) & 0xff;
+          wire[12] = (guint8) (((guint32) (FT9338_ENROLL_STAGES * FT9338_IMAGE_SIZE)) >> 8) & 0xff;
+          wire[13] = (guint8) ((guint32) (FT9338_ENROLL_STAGES * FT9338_IMAGE_SIZE)) & 0xff;
+          for (i = 0; i < FT9338_ENROLL_STAGES; i++)
+            memcpy (wire + 14 + (gsize) i * FT9338_IMAGE_SIZE,
+                    self->enroll_frames[i]->pixels, FT9338_IMAGE_SIZE);
+
+          /* element type BYTE (fte3600.c:439 pattern) — passing
+           * G_VARIANT_TYPE ("ay") here creates "aay" (non-fixed-size),
+           * which crashes fp_print_serialize (2026-10-07 run evidence). */
+          data = g_variant_ref_sink (
+            g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, wire, wire_len, 1));
+          g_assert (g_variant_is_of_type (data, G_VARIANT_TYPE ("ay")));
+          fpi_print_set_type (self->enroll_print, FPI_PRINT_RAW);
+          g_object_set (self->enroll_print, "fpi-data", data, NULL);
+          g_variant_unref (data);
+          g_free (wire);
+
+          fpi_device_enroll_complete (dev, g_object_ref (self->enroll_print), NULL);
+          fte7001_clear_enroll_frames (self);
+          g_clear_object (&self->enroll_print);
+          return;
+        }
+      /* Failure/timeout path */
+      {
+        GError *e = error;
+        if (e && g_error_matches (e, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+          e = fpi_device_retry_new (FP_DEVICE_RETRY_TOO_SHORT);
+        if (e && e->domain == FP_DEVICE_RETRY)
+          {
+            /* Retryable (finger-wait timeout / quality cap): report the
+             * stage with the retry error so the UI can prompt, then
+             * restart the capture SSM — form B has no framework-side
+             * re-arm loop (fte3600 restarts its scan the same way). */
+            fpi_device_enroll_progress (dev, self->enroll_stage, NULL, e);
+            if (error) g_error_free (error);
+            fte7001_start_capture_ssm (self, dev);
+            return;
+          }
+        fpi_device_enroll_complete (dev, NULL, e ? e : error);
+        if (e != error) g_error_free (e);
+        return;
+      }
+  }
+  else if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
+    {
+      if (error)
+        {
+          if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+            {
+              /* Framework contract: a verify action must always have a
+               * reported result before complete — bare complete(NULL)
+               * triggers "did not report the result earlier" and the
+               * action is turned into verify-no-match (journal proof,
+               * 2026-10-07 22:38:11). */
+              fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                         g_error_copy (error));
+              fpi_device_verify_complete (dev, NULL);
+              return;
+            }
+          if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+            {
+              fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                fpi_device_retry_new (FP_DEVICE_RETRY_TOO_SHORT));
+              fpi_device_verify_complete (dev, NULL);
+              return;
+            }
+          if (error->domain == FP_DEVICE_RETRY)
+            {
+              fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                        g_error_copy (error));
+              fpi_device_verify_complete (dev, NULL);
+              return;
+            }
+          fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                    g_error_copy (error));
+          fpi_device_verify_complete (dev, NULL);
+          return;
+        }
+      /* Happy path: probe captured — dispatch the matcher worker. */
+      fte7001_start_verify_match (self);
       return;
     }
-  if (!error)
-    return;                     /* e.g. cancelled transfer — deactivate will clean up */
-  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+  else
     {
-      /* Nobody touched the sensor in FT9338_FINGER_TIMEOUT_MS — tell the
-       * framework and let it re-activate when it cares again. */
-      fpi_image_device_retry_scan (FP_IMAGE_DEVICE (dev),
-                                    FP_DEVICE_RETRY_TOO_SHORT);
-      return;
+      /* FPI_DEVICE_ACTION_NONE and everything else */
+      if (error)
+        g_error_free (error);
     }
-  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-    return;                     /* deactivation path — nothing to report */
-  fpi_image_device_session_error (FP_IMAGE_DEVICE (dev),
-                                  g_error_copy (error));
+}
+
+/* ----- Template wire helpers (design §五) ----- */
+
+static void
+fte7001_clear_enroll_frames (FpiDeviceFte7001 *self)
+{
+  guint i;
+  for (i = 0; i < FT9338_ENROLL_STAGES; i++)
+    g_clear_pointer (&self->enroll_frames[i], g_free);
+}
+
+/* Decode the "FT93" wire template (all multi-byte header fields
+ * big-endian).  Returns a freshly allocated array of *n_frames frames,
+ * or NULL with a caller-friendly GError. */
+static Fte7001Frame *
+fte7001_template_decode (const guint8 *wire, gsize wire_size,
+                         guint *n_frames, GError **error)
+{
+  Fte7001Frame *frames;
+  guint count, i;
+  guint32 payload_len;
+
+  if (wire_size < 14 ||
+      wire[0] != 'F' || wire[1] != 'T' || wire[2] != '9' || wire[3] != '3')
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                   "FTE7001 template magic mismatch");
+      return NULL;
+    }
+  if (wire[4] != 1)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
+                   "FTE7001 template version %u unsupported", wire[4]);
+      return NULL;
+    }
+  count = wire[5];
+  if (count < 1 || count > 16)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                   "FTE7001 template frame count %u invalid", count);
+      return NULL;
+    }
+  /* width/height big-endian (design §五: 全头统一大端) */
+  if ((wire[6] << 8 | wire[7]) != FT9338_IMAGE_WIDTH ||
+      (wire[8] << 8 | wire[9]) != FT9338_IMAGE_HEIGHT)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                   "FTE7001 template geometry mismatch");
+      return NULL;
+    }
+  payload_len = ((guint32) wire[10] << 24) | ((guint32) wire[11] << 16) |
+                ((guint32) wire[12] << 8) | (guint32) wire[13];
+  if (payload_len != (guint32) count * FT9338_IMAGE_SIZE ||
+      14 + (gsize) payload_len != wire_size)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                   "FTE7001 template length check failed");
+      return NULL;
+    }
+
+  frames = g_new (Fte7001Frame, count);
+  for (i = 0; i < count; i++)
+    memcpy (frames[i].pixels, wire + 14 + (gsize) i * FT9338_IMAGE_SIZE,
+            FT9338_IMAGE_SIZE);
+  *n_frames = count;
+  return frames;
+}
+
+/* ----- Verify matcher worker (GTask, fte3600 pattern) ----- */
+
+typedef struct {
+  Fte7001Frame *template_frames;   /* owned copy */
+  guint n_template_frames;
+  Fte7001Frame probe;               /* owned copy */
+} Fte7001VerifyJob;
+
+static void
+fte7001_verify_job_free (gpointer p)
+{
+  Fte7001VerifyJob *job = p;
+  g_free (job->template_frames);
+  g_free (job);
 }
 
 static void
-fte7001_start_capture (FpiDeviceFte7001 *self)
+fte7001_verify_match_worker (GTask *task, gpointer source, gpointer task_data,
+                             GCancellable *cancellable)
+{
+  Fte7001VerifyJob *job = task_data;
+  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (source);
+  Fte7001FeatureSet probe_fs;
+  float best = 0.0f;
+  float scores[32];             /* per-template-frame score trail */
+  guint n_scores = 0;
+  guint i;
+
+  (void) self;
+
+  if (g_task_return_error_if_cancelled (task))
+    return;
+
+  /* Descriptors are computed fresh from the raw frames here (design §四:
+   * no cross-action caching; worker owns its data only).  Known future
+   * optimization: precompute template descriptors at template-decode time
+   * and carry them in the job (saves 9/9 recomputes per verify) —
+   * deliberately NOT done during the observation period to avoid
+   * introducing new variables while thresholds are being tuned. */
+  probe_fs = fte7001_feature_extract (&job->probe);
+  if (probe_fs.n_feats > 0)
+    {
+      for (i = 0; i < job->n_template_frames; i++)
+        {
+          Fte7001FeatureSet tfs;
+
+          if (g_cancellable_is_cancelled (cancellable))
+            {
+              /* Abort mid-loop: free what we hold and return an error so
+               * the GTask completes (a bare return would leak the task
+               * into "never completes" and hang the action). */
+              fte7001_feature_set_free (&probe_fs);
+              g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                       "FTE7001 verify match was cancelled");
+              return;
+            }
+
+          tfs = fte7001_feature_extract (&job->template_frames[i]);
+          {
+            float s = 0.0f;
+
+            if (tfs.n_feats >= FT9338_M_MIN_FEATS)
+              s = fte7001_match_score (&tfs, &probe_fs);
+            if (s > best)
+              best = s;
+            if (n_scores < G_N_ELEMENTS (scores))
+              scores[n_scores++] = s;
+          }
+          fte7001_feature_set_free (&tfs);
+        }
+    }
+  fte7001_feature_set_free (&probe_fs);
+
+  /* Per-frame score trail in the journal: keeps the raw distribution so
+   * threshold tuning and "top-2 instead of max" experiments can be
+   * re-evaluated offline from logs alone (no re-enrollment needed). */
+  if (n_scores > 0)
+    {
+      GString *gs = g_string_new ("FT9338 verify per-frame scores:");
+      float top1 = 0.0f, top2 = 0.0f;
+
+      for (i = 0; i < n_scores; i++)
+        {
+          g_string_append_printf (gs, " %.1f", scores[i]);
+          if (scores[i] > top1)
+            { top2 = top1; top1 = scores[i]; }
+          else if (scores[i] > top2)
+            top2 = scores[i];
+        }
+      g_string_append_printf (gs, "  top2=(%.1f, %.1f)", top1, top2);
+      fp_dbg ("%s", gs->str);
+      g_string_free (gs, TRUE);
+    }
+
+  g_task_return_int (task, (gssize) roundf (best * 100.0f));
+}
+
+static void
+fte7001_verify_match_done (GObject *source, GAsyncResult *result, gpointer user_data)
+{
+  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (source);
+  FpDevice *dev = FP_DEVICE (self);
+  gssize raw;
+  float score;
+  gboolean match;
+
+  (void) user_data;
+
+  if (g_task_had_error (G_TASK (result)))
+    {
+      /* Cancelled mid-match.  On cancel the framework calls fte7001_cancel
+       * and the SSM exits through its own complete callback which has
+       * ALREADY run verify_complete for the cancellation — completing
+       * again here would double-complete the action.  Only complete if
+       * the verify action is somehow still pending (SSM already gone). */
+      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
+        fpi_device_verify_complete (dev, NULL);
+      return;
+    }
+
+  raw = g_task_propagate_int (G_TASK (result), NULL);
+  score = (float) raw / 100.0f;
+  match = score >= FT9338_MATCH_THRESHOLD;
+  fp_dbg ("FT9338 verify score %.1f (threshold %.1f) → %s",
+          score, FT9338_MATCH_THRESHOLD, match ? "MATCH" : "no-match");
+  fpi_device_verify_report (dev, match ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
+                            NULL, NULL);
+  fpi_device_verify_complete (dev, NULL);
+}
+
+static void
+fte7001_start_verify_match (FpiDeviceFte7001 *self)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  FpPrint *print = NULL;
+  g_autoptr(GVariant) data = NULL;
+  const guint8 *wire;
+  gsize wire_size = 0;
+  GError *error = NULL;
+  Fte7001Frame *frames;
+  guint n_frames;
+  Fte7001VerifyJob *job;
+  GTask *task;
+
+  fpi_device_get_verify_data (dev, &print);
+  if (print == NULL || !fp_print_compatible (print, dev) ||
+      fpi_print_get_type (print) != FPI_PRINT_RAW)
+    {
+      fpi_device_verify_complete (dev, fpi_device_error_new_msg (
+        FP_DEVICE_ERROR_DATA_INVALID,
+        "FTE7001 verification requires a compatible raw template"));
+      return;
+    }
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (data == NULL || !g_variant_is_of_type (data, G_VARIANT_TYPE ("ay")) ||
+      !g_variant_is_normal_form (data))
+    {
+      fpi_device_verify_complete (dev, fpi_device_error_new_msg (
+        FP_DEVICE_ERROR_DATA_INVALID,
+        "FTE7001 verification template has an invalid container"));
+      return;
+    }
+  wire = g_variant_get_fixed_array (data, &wire_size, 1);
+  frames = fte7001_template_decode (wire, wire_size, &n_frames, &error);
+  if (frames == NULL)
+    {
+      fpi_device_verify_complete (dev, error);
+      return;
+    }
+
+  job = g_new0 (Fte7001VerifyJob, 1);
+  job->template_frames = frames;
+  job->n_template_frames = n_frames;
+  job->probe = self->verify_probe;   /* struct copy */
+  self->verify_probe_valid = FALSE;
+
+  self->worker_cancellable = g_cancellable_new ();
+  task = g_task_new (dev, self->worker_cancellable,
+                     fte7001_verify_match_done, NULL);
+  g_task_set_task_data (task, job, fte7001_verify_job_free);
+  g_task_set_return_on_cancel (task, FALSE);
+  g_task_run_in_thread (task, fte7001_verify_match_worker);
+  g_object_unref (task);
+}
+
+/* ----- Action entry points (form B) ----- */
+
+static void
+fte7001_start_capture_ssm (FpiDeviceFte7001 *self, FpDevice *dev)
 {
   FpiSsm *ssm;
 
-  fte7001_clear_captured_image (self);
-  ssm = fpi_ssm_new (FP_DEVICE (self), fte7001_capture_handler,
-                     FTE7001_CAPTURE_NSTATES);
-  self->task_ssm = ssm;
+  self->image_handed_over = FALSE;
+  self->quality_retries = 0;
   self->capture_deadline =
     g_get_monotonic_time () + (gint64) FT9338_FINGER_TIMEOUT_MS * 1000;
+  ssm = fpi_ssm_new (dev, fte7001_capture_handler, FTE7001_CAPTURE_NSTATES);
+  self->task_ssm = ssm;
   fpi_ssm_start (ssm, fte7001_capture_complete);
 }
 
-/* ----- Action entry points (FpImageDevice) ----- */
 static void
-fte7001_activate (FpImageDevice *dev)
+fte7001_enroll (FpDevice *dev)
 {
   FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (dev);
-  fte7001_start_capture (self);
-  fpi_image_device_activate_complete (dev, NULL);
+  FpPrint *print = NULL;
+
+  fte7001_clear_enroll_frames (self);
+  self->enroll_stage = 0;
+  fpi_device_get_enroll_data (dev, &print);
+  /* fpi_device_get_enroll_data returns a borrowed reference — take our
+   * own for self->enroll_print (released in finalize / after complete). */
+  g_set_object (&self->enroll_print, print);
+  fte7001_start_capture_ssm (self, dev);
 }
 
 static void
-fte7001_deactivate (FpImageDevice *dev)
+fte7001_verify (FpDevice *dev)
 {
-  /* Do NOT cancel the action cancellable here.  The framework cancels it
-   * itself when an external stop arrives, and fpi_image_device_
-   * deactivate_complete() → maybe_complete_action() relies on
-   * g_cancellable_set_error_if_cancelled() to produce the correct final
-   * status — cancelling it from the driver turns every successful
-   * identify/enroll into G_IO_ERROR_CANCELLED (the "enroll-failed after
-   * first touch" killer, 2026-10-07).  The poll loop exits gracefully
-   * via fte7001_fail_if_cancelled() on the next iteration. */
-  fpi_image_device_deactivate_complete (dev, NULL);
+  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (dev);
+
+  self->verify_probe_valid = FALSE;
+  fte7001_start_capture_ssm (self, dev);
+}
+
+static void
+fte7001_cancel (FpDevice *dev)
+{
+  FpiDeviceFte7001 *self = FPI_DEVICE_FTE7001 (dev);
+
+  /* Kill the matcher worker only.  The action cancellable belongs to
+   * the framework — cancelling it from the driver turns successful
+   * actions into G_IO_ERROR_CANCELLED (the 2026-10-07 killer; the
+   * same rule as the old deactivate).  The SSM exits through
+   * fte7001_fail_if_cancelled at the next state entry. */
+  if (self->worker_cancellable)
+    g_cancellable_cancel (self->worker_cancellable);
 }
 
 /* ----- Class init ----- */
@@ -1515,7 +2062,10 @@ fpi_device_fte7001_finalize (GObject *object)
   g_free (self->capture_rx);
   g_free (self->fw_write_buf);
   g_free (self->fw_readback_buf);
-  fte7001_clear_captured_image (self);
+  fte7001_clear_enroll_frames (self);
+  g_clear_object (&self->enroll_print);
+  g_clear_pointer (&self->spidev_cached, g_free);
+  g_clear_object (&self->worker_cancellable);
 
   G_OBJECT_CLASS (fpi_device_fte7001_parent_class)->finalize (object);
 }
@@ -1523,8 +2073,7 @@ fpi_device_fte7001_finalize (GObject *object)
 static void
 fpi_device_fte7001_class_init (FpiDeviceFte7001Class *klass)
 {
-  FpDeviceClass      *dev_class = FP_DEVICE_CLASS (klass);
-  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
+  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
 
   dev_class->id       = "fte7001";
   dev_class->full_name = "FocalTech FT9338 Embedded Fingerprint Sensor";
@@ -1532,17 +2081,16 @@ fpi_device_fte7001_class_init (FpiDeviceFte7001Class *klass)
   dev_class->id_table = fte7001_id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   dev_class->temp_hot_seconds = -1;
-  dev_class->nr_enroll_stages = 7;
+  dev_class->nr_enroll_stages = FT9338_ENROLL_STAGES;   /* 9 (2026-10-07 定稿) */
 
-  dev_class->probe  = NULL;  /* using id_table spidev match */
-
-  img_class->img_open  = fte7001_img_open;
-  img_class->img_close = fte7001_img_close;
-  img_class->activate  = fte7001_activate;
-  img_class->deactivate = fte7001_deactivate;
-  img_class->bz3_threshold = 25;
-  img_class->img_width  = FT9338_IMAGE_WIDTH;
-  img_class->img_height = FT9338_IMAGE_HEIGHT;
+  dev_class->probe   = NULL;  /* using id_table spidev match */
+  dev_class->open    = fte7001_open;
+  dev_class->close   = fte7001_close;
+  dev_class->enroll  = fte7001_enroll;
+  dev_class->verify  = fte7001_verify;
+  dev_class->cancel  = fte7001_cancel;
+  /* identify not implemented: single-user lock-screen only needs verify
+   * (fte3600 leaves it NULL for the same reason). */
 
   G_OBJECT_CLASS (klass)->finalize = fpi_device_fte7001_finalize;
   fpi_device_class_auto_initialize_features (dev_class);
