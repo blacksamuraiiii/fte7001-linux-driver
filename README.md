@@ -4,6 +4,9 @@ FocalTech **FT9338**（ACPI `_HID`: **FTE7001**）的 Linux 指纹传感器驱�
 
 仓库地址：<https://github.com/blacksamuraiiii/fte7001-linux-driver>
 
+> **本仓库已归档**：后续开发与发布移至
+> <https://github.com/blacksamuraiiii/libfprint-fte7001>（基于官方上游 libfprint v1.94.10 的完整下游树，含本仓库 v2.0 的全部驱动成果与 libfprint 层挂起死锁修复）。
+
 **版本 v2.0 —— 形态 B：FpDevice + 自研关键点匹配器，fprintd 全链路（enroll/verify/锁屏）实测通过。**
 
 88×88 像素 match-on-host 传感器（非 match-on-chip），508 DPI，有效面积约 4.4×4.4 mm。SPI 通信（Intel LPSS，Mode 0，1 MHz），GPIO85 复位（nRST），GPIO86 中断在 Linux 下不触发（驱动用轮询兜底）。
@@ -155,7 +158,7 @@ v2.0 起锁屏走 pam_fprintd（官方链）；`fp-unlock.py` 保留为独立备
 降级/排障用）。`fp-unlock.py` 冷启动自愈需要 `/usr/local/libexec/ft9338-firmware.bin`
 （与本仓库 `driver/ft9338-firmware.inc` 同源，14136 B）。
 
-首次登录界面（SDDM）目前仍用密码（未接 pam_fprintd）。
+首次登录界面（SDDM）在 v2.0 之后已接入 pam_fprintd（LUKS 全盘在线解密 + `/etc/pam.d/sddm` 双 sufficient），开机指纹直达桌面已打通——本仓库定格于 v2.0 时代的历史描述，后续演进见新仓库。
 
 ### 匹配器（形态 B 核心）
 
